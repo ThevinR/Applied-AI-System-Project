@@ -2,7 +2,17 @@ from datetime import time
 
 import streamlit as st
 
-from pawpal_system import Frequency, Owner, Pet, Priority, Scheduler, Task
+from pawpal_system import (
+    AI_LOG_PATH,
+    Frequency,
+    Owner,
+    PetCareAgent,
+    Pet,
+    Priority,
+    Scheduler,
+    Task,
+    log_agent_run,
+)
 
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="centered")
 
@@ -222,3 +232,97 @@ if st.button("Generate schedule"):
 
         with st.expander("Why this plan?"):
             st.text(scheduler.explain_plan())
+
+# ---------------------------------------------------------------------------
+# Agentic review (sidebar): Planner -> Executor -> Evaluator -> Reflector
+# ---------------------------------------------------------------------------
+
+STAGE_ICONS = {
+    "INPUT": "📥",
+    "PLANNER": "🧭",
+    "EXECUTOR": "🔧",
+    "EVALUATOR": "🔍",
+    "REFLECTOR": "🪞",
+}
+
+with st.sidebar:
+    st.header("Run Agentic Review")
+    st.caption(
+        "A four-stage loop checks today's schedule for missing care steps, "
+        "clashes and feeding gaps, then fixes what it can."
+    )
+    st.warning(
+        "This edits your schedule: it can add missing care tasks and move "
+        "task times. Medication-style tasks are never moved.",
+        icon="⚠️",
+    )
+    max_iterations = int(
+        st.number_input("Max iterations", min_value=1, max_value=10, value=3)
+    )
+    run_review = st.button("Run Agentic Review", type="primary")
+
+if run_review:
+    if not all_tasks:
+        st.sidebar.warning("Add at least one task first.")
+    else:
+        agent = PetCareAgent(owner, scheduler, max_iterations=max_iterations)
+        with st.spinner("Running Planner → Executor → Evaluator → Reflector…"):
+            agent.run()
+        st.session_state.agent = agent
+        # The loop logs itself on every run; a logging failure must not lose
+        # the review the user just waited for.
+        try:
+            st.session_state.agent_log_path = str(log_agent_run(agent, source="streamlit app"))
+            st.session_state.agent_log_error = None
+        except OSError as exc:
+            st.session_state.agent_log_path = None
+            st.session_state.agent_log_error = str(exc)
+
+agent = st.session_state.get("agent")
+
+if agent is not None:
+    st.divider()
+    st.subheader("Agentic Review")
+
+    if agent.approved:
+        st.success(
+            f"Reflector verdict: **APPROVED** after {agent.iterations_used} iteration(s). "
+            "The schedule is complete, conflict-free and well spaced."
+        )
+    else:
+        st.warning(
+            f"Reflector verdict: **NEEDS REVIEW** after {agent.iterations_used} "
+            "iteration(s). Some issues need a human decision — see the trail below."
+        )
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Iterations", agent.iterations_used)
+    col2.metric("Tasks scheduled", len(agent.schedule))
+    col3.metric("Steps logged", len(agent.log))
+
+    st.markdown("**Audit trail**")
+    for step in agent.log:
+        icon = STAGE_ICONS.get(step.stage, "•")
+        label = (
+            f"{icon} Iteration {step.iteration} · {step.stage.title()} — {step.summary}"
+        )
+        # The verdict and any unresolved stage open by default; the rest stay
+        # collapsed so a long run is still readable.
+        expanded = step.stage == "REFLECTOR"
+        with st.expander(label, expanded=expanded):
+            st.caption(f"Logged at {step.timestamp:%H:%M:%S}")
+            for detail in step.details:
+                st.markdown(f"- {detail}")
+
+    st.markdown("**Revised schedule**")
+    if agent.schedule:
+        st.table(task_rows(agent.schedule))
+    else:
+        st.info("The agent produced an empty schedule.")
+
+    log_path = st.session_state.get("agent_log_path")
+    log_error = st.session_state.get("agent_log_error")
+    if log_error:
+        st.error(f"Could not write {AI_LOG_PATH.name}: {log_error}")
+    elif log_path:
+        st.caption(f"Run appended to `{log_path}`.")
