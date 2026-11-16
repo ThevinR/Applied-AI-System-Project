@@ -4,6 +4,7 @@ import streamlit as st
 
 from pawpal_system import (
     AI_LOG_PATH,
+    DAY_BLOCKS,
     IDEAL_FEEDING_GAP_MINUTES,
     MIN_FEEDING_GAP_MINUTES,
     SAFE_WINDOW,
@@ -88,9 +89,11 @@ STAGE_BLURBS = {
 #: trail reads as sentences instead of `[HIGH] missing_care: ...` dumps.
 ISSUE_KINDS = {
     "missing_care": ("🚫", "Missing care"),
+    "unscheduled_care": ("📦", "Care not in plan"),
     "conflict": ("⏱️", "Overlap"),
     "feeding_gap": ("🍽️", "Feeding gap"),
     "unsafe_time": ("🌙", "Unsafe time"),
+    "over_budget": ("⏳", "Not enough time"),
     "untimed": ("❓", "No time set"),
 }
 
@@ -489,10 +492,23 @@ with tab_review:
                 icon="⚠️",
             )
 
-        c1, c2, c3 = st.columns(3)
+        agent_committed = sum(t.duration_minutes for t in agent.schedule)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Iterations", agent.iterations_used)
         c2.metric("Tasks scheduled", len(agent.schedule))
-        c3.metric("Steps logged", len(agent.log))
+        c3.metric(
+            "Time committed",
+            f"{agent_committed} min",
+            delta=f"of {owner.available_minutes} min available",
+            delta_color="off",
+        )
+        c4.metric("Steps logged", len(agent.log))
+        if agent_committed > owner.available_minutes:
+            st.error(
+                f"The reviewed plan asks for {agent_committed} min but only "
+                f"{owner.available_minutes} min are available.",
+                icon="⏳",
+            )
 
         trail, revised = st.columns([3, 2], gap="large")
 
@@ -611,6 +627,17 @@ with tab_insights:
         "Required daily care — dog: feed, water, walk · cat: feed, water, litter · "
         "rabbit: feed, water, clean · other: feed, water. "
         "Medication-style tasks are pinned and never moved."
+    )
+
+    st.markdown("**Day blocks the executor places care into**")
+    block_cols = st.columns(len(DAY_BLOCKS))
+    for col, (name, (start, end)) in zip(block_cols, DAY_BLOCKS.items()):
+        col.metric(name.title(), f"{start:%H:%M}–{end:%H:%M}")
+    st.caption(
+        "New care is placed inside whichever block suits it and is least "
+        "crowded for that pet, so a day reads as a routine rather than a "
+        "queue. A second feeding is pushed to the block furthest from the "
+        "first meal."
     )
 
     st.divider()

@@ -277,22 +277,38 @@ MIN_FEEDING_GAP_MINUTES = 360
 #: half the waking day, so morning and evening meals sit opposite each other.
 #: The Evaluator only enforces the minimum; this is the target, not a rule.
 IDEAL_FEEDING_GAP_MINUTES = 420
-#: Feedings are also kept away from the far ends of the safe window, so an
-#: evenly spaced meal does not land at the very edge of the day.
-FEEDING_WINDOW = (time(6, 30), time(21, 0))
 #: Feeding, walking and medication should fall inside waking hours.
 SAFE_WINDOW = (time(6, 0), time(22, 0))
 #: Medication is time-critical: the executor will not move it.
 PINNED_KEYWORDS = ("medicat", "medicine", "insulin", "dose")
 
-#: Where the executor tries to put an untimed or displaced task, in order.
-_SLOT_PREFERENCE = {
-    "feed": (time(7, 0), time(17, 0), time(12, 0)),
-    "walk": (time(8, 0), time(18, 0), time(12, 30)),
-    "water": (time(7, 30), time(16, 0)),
-    "litter": (time(9, 0), time(19, 0)),
-    "clean": (time(10, 0), time(16, 30)),
+#: The parts of the day a person actually recognises. Daily care is placed
+#: inside one of these blocks so a generated schedule reads like a real
+#: routine ("dinner at 18:00") instead of landing on whichever half-hour
+#: happened to be free first ("second feed at 10:00").
+DAY_BLOCKS: Dict[str, Tuple[time, time]] = {
+    "morning": (time(7, 0), time(9, 0)),
+    "afternoon": (time(13, 0), time(15, 0)),
+    "evening": (time(18, 0), time(20, 0)),
 }
+
+#: Which blocks suit which kind of care, best first. A second feeding should
+#: land in the evening rather than be squeezed in beside breakfast, so "feed"
+#: prefers morning then evening, keeping afternoon as the third meal slot.
+_BLOCK_PREFERENCE: Dict[str, Tuple[str, ...]] = {
+    "feed": ("morning", "evening", "afternoon"),
+    "walk": ("morning", "evening", "afternoon"),
+    "water": ("morning", "afternoon", "evening"),
+    "litter": ("morning", "afternoon", "evening"),
+    "clean": ("afternoon", "morning", "evening"),
+}
+#: Used for care that matches none of the keywords above.
+_DEFAULT_BLOCK_ORDER: Tuple[str, ...] = ("morning", "afternoon", "evening")
+
+#: Start times are snapped to this grid, so plans read in round numbers.
+_BLOCK_GRID_MINUTES = 15
+
+#: Last resort when every block is full: any half hour in the safe window.
 _FALLBACK_SLOTS = tuple(time(h, m) for h in range(6, 22) for m in (0, 30))
 
 
@@ -363,6 +379,9 @@ class PetCareAgent:
         self.max_iterations = max_iterations
         self.log: List[LoopStep] = []
         self.schedule: List[Task] = []
+        #: Care the Executor could not fit in the owner's available time, set
+        #: each pass and read by the Evaluator.
+        self._deferred: List[Issue] = []
         self.approved = False
         self.iterations_used = 0
         self.started_at: Optional[datetime] = None
@@ -391,61 +410,106 @@ class PetCareAgent:
             spans.append((start, start + t.duration_minutes))
         return spans
 
-    def _free_slot(self, task: Task, schedule: List[Task],
-                   avoid: Optional[List[Tuple[int, int]]] = None,
-                   late_first: bool = False) -> Optional[time]:
-        """Find the first slot for `task` that clashes with nothing.
+    @staticmethod
+    def _block_order(task: Task, anchors: List[int],
+                     crowding: Optional[Dict[str, int]] = None) -> List[str]:
+        """Rank the day's blocks for this task, best first.
 
-        Tries the care-type's preferred slots first, then every half hour inside
-        the safe window. `avoid` adds extra windows to stay clear of (used for
-        feeding spacing). `late_first` scans the day backwards, for a task that
-        should land as late as possible. Returns None when the day is full.
+        Three things decide the order:
+          * anchors - the pet's existing feedings. The block furthest from them
+            wins, so a second meal is pushed to the opposite end of the day
+            rather than clustering beside the first.
+          * crowding - how many of this pet's tasks already sit in each block.
+            Emptier blocks win, which spreads a pet's day out instead of
+            stacking its whole routine into the morning.
+          * the care-type preference, which breaks any remaining tie.
         """
-        busy = self._occupied(schedule, exclude=task) + list(avoid or [])
-        low, high = _minutes(SAFE_WINDOW[0]), _minutes(SAFE_WINDOW[1])
-        keyword = next((k for k in _SLOT_PREFERENCE if _matches(task, k)), None)
-        preferred = _SLOT_PREFERENCE.get(keyword, ())
-        fallback = tuple(reversed(_FALLBACK_SLOTS)) if late_first else _FALLBACK_SLOTS
-        if late_first:
-            preferred = tuple(sorted(preferred, reverse=True))
-        candidates = preferred + fallback
-        for candidate in candidates:
-            start = _minutes(candidate)
-            end = start + task.duration_minutes
-            if start < low or end > high:
+        keyword = next((k for k in _BLOCK_PREFERENCE if _matches(task, k)), None)
+        preference = _BLOCK_PREFERENCE.get(keyword, _DEFAULT_BLOCK_ORDER)
+        ranked = [name for name in preference if name in DAY_BLOCKS]
+        ranked += [name for name in DAY_BLOCKS if name not in ranked]
+        counts = crowding or {}
+
+        def distance(name: str) -> int:
+            if not anchors:
+                return 0
+            start, end = DAY_BLOCKS[name]
+            centre = (_minutes(start) + _minutes(end)) // 2
+            return min(abs(centre - anchor) for anchor in anchors)
+
+        return sorted(
+            ranked,
+            key=lambda name: (-distance(name), counts.get(name, 0), ranked.index(name)),
+        )
+
+    @staticmethod
+    def _crowding(task: Task, schedule: List[Task]) -> Dict[str, int]:
+        """Count how many of this pet's tasks already fall in each day block."""
+        counts = {name: 0 for name in DAY_BLOCKS}
+        for other in schedule:
+            if other is task or other.pet_name != task.pet_name:
                 continue
-            if all(end <= b_start or start >= b_end for b_start, b_end in busy):
-                return candidate
+            if not isinstance(other.preferred_time, time):
+                continue
+            start = _minutes(other.preferred_time)
+            for name, (block_start, block_end) in DAY_BLOCKS.items():
+                if _minutes(block_start) <= start < _minutes(block_end):
+                    counts[name] += 1
+                    break
+        return counts
+
+    def _slot_in_block(self, task: Task, name: str, busy: List[Tuple[int, int]],
+                       anchors: List[int], min_gap: int) -> Optional[time]:
+        """First free, correctly spaced start time inside one named block."""
+        block_start, block_end = DAY_BLOCKS[name]
+        safe_high = _minutes(SAFE_WINDOW[1])
+        for start in range(_minutes(block_start), _minutes(block_end),
+                           _BLOCK_GRID_MINUTES):
+            end = start + task.duration_minutes
+            if end > safe_high:
+                break
+            if any(start < b_end and b_start < end for b_start, b_end in busy):
+                continue
+            if anchors and min_gap:
+                if min(abs(start - anchor) for anchor in anchors) < min_gap:
+                    continue
+            return _from_minutes(start)
         return None
 
-    def _spaced_feeding_slot(self, task: Task, schedule: List[Task],
-                             others: List[Task]) -> Optional[time]:
-        """Place a feeding so the pet's meals are spread evenly across the day.
+    def _natural_slot(self, task: Task, schedule: List[Task],
+                      anchors: Optional[List[time]] = None,
+                      min_gap: int = 0) -> Optional[time]:
+        """Place a task at a time a person would actually choose.
 
-        `_free_slot` takes the *first* candidate that merely clears the minimum
-        gap, which tends to park a second meal just past the threshold and
-        leave the rest of the day empty. This instead scores every free slot in
-        the feeding window by its distance to the nearest existing feeding,
-        discards anything closer than MIN_FEEDING_GAP_MINUTES, and keeps the
-        slot whose spacing is nearest IDEAL_FEEDING_GAP_MINUTES — so a 07:00
-        breakfast gets a 14:00-ish second meal rather than an 11:00 one.
+        Tries the recognised day blocks (morning / afternoon / evening) in the
+        order `_block_order` gives, which pushes supplementary care away from
+        the care it supplements. Only when every block is full does it fall
+        back to scanning the safe window half hour by half hour, so the
+        schedule degrades gracefully on a very busy day rather than failing.
 
         Args:
-            task: The feeding to place.
+            task: The task to place.
             schedule: The current schedule, used for clash detection.
-            others: The pet's other timed feedings, used as spacing anchors.
+            anchors: Times to stay clear of, e.g. the pet's other feedings.
+            min_gap: Minimum minutes between the slot and every anchor.
 
         Returns:
-            The best slot, or None when no slot is both free and far enough
-            from every existing feeding.
+            A start time, or None when nothing free satisfies the spacing.
         """
         busy = self._occupied(schedule, exclude=task)
-        low, high = _minutes(FEEDING_WINDOW[0]), _minutes(FEEDING_WINDOW[1])
-        anchors = [
-            _minutes(f.preferred_time)
-            for f in others
-            if f is not task and isinstance(f.preferred_time, time)
+        anchor_minutes = [
+            _minutes(t) for t in (anchors or []) if isinstance(t, time)
         ]
+
+        crowding = self._crowding(task, schedule)
+        for name in self._block_order(task, anchor_minutes, crowding):
+            slot = self._slot_in_block(task, name, busy, anchor_minutes, min_gap)
+            if slot is not None:
+                return slot
+
+        # Every block is taken. Keep the schedule valid even if it reads less
+        # tidily, preferring the slot closest to the ideal spacing.
+        low, high = _minutes(SAFE_WINDOW[0]), _minutes(SAFE_WINDOW[1])
         best: Optional[time] = None
         best_key: Optional[tuple] = None
         for candidate in _FALLBACK_SLOTS:
@@ -455,17 +519,111 @@ class PetCareAgent:
                 continue
             if any(start < b_end and b_start < end for b_start, b_end in busy):
                 continue
-            if not anchors:
+            if not anchor_minutes:
                 return candidate
-            gap = min(abs(start - anchor) for anchor in anchors)
-            if gap < MIN_FEEDING_GAP_MINUTES:
+            gap = min(abs(start - anchor) for anchor in anchor_minutes)
+            if min_gap and gap < min_gap:
                 continue
-            # Closest to the ideal spacing wins; ties go to the earlier slot so
-            # the result is deterministic.
             key = (abs(gap - IDEAL_FEEDING_GAP_MINUTES), start)
             if best_key is None or key < best_key:
                 best_key, best = key, candidate
         return best
+
+    def _free_slot(self, task: Task, schedule: List[Task]) -> Optional[time]:
+        """Place a task at the first natural time that clashes with nothing."""
+        return self._natural_slot(task, schedule)
+
+    def _spaced_feeding_slot(self, task: Task, schedule: List[Task],
+                             others: List[Task]) -> Optional[time]:
+        """Place a feeding in a day block well clear of the pet's other meals.
+
+        Breakfast sits in the morning block, so the second meal is ranked into
+        the evening block first and the afternoon block second — never squeezed
+        in beside the meal it is meant to complement. Spacing of at least
+        MIN_FEEDING_GAP_MINUTES is enforced on top of the block choice.
+
+        Args:
+            task: The feeding to place.
+            schedule: The current schedule, used for clash detection.
+            others: The pet's other timed feedings, used as spacing anchors.
+
+        Returns:
+            The chosen slot, or None when nothing is both free and far enough
+            from every existing feeding.
+        """
+        anchors = [
+            f.preferred_time
+            for f in others
+            if f is not task and isinstance(f.preferred_time, time)
+        ]
+        return self._natural_slot(
+            task, schedule, anchors=anchors, min_gap=MIN_FEEDING_GAP_MINUTES
+        )
+
+    @staticmethod
+    def _committed_minutes(schedule: List[Task]) -> int:
+        """Total minutes the schedule asks of the owner."""
+        return sum(t.duration_minutes for t in schedule)
+
+    def _fits_budget(self, task: Task, schedule: List[Task]) -> bool:
+        """True when adding `task` keeps the plan inside the owner's time.
+
+        Re-timing a task that is already in the plan costs nothing, so this is
+        only consulted before something new is brought in.
+        """
+        committed = self._committed_minutes(schedule)
+        return committed + task.duration_minutes <= self.owner.available_minutes
+
+    def _defer(self, task: Task, pet_name: str, schedule: List[Task],
+               reason: str) -> str:
+        """Record that care had to be left out for lack of time.
+
+        Returns the line for the Executor's action log. The deferral is also
+        kept on self._deferred so the Evaluator can fail the run: silently
+        dropping required care would be worse than reporting it.
+        """
+        remaining = self.owner.available_minutes - self._committed_minutes(schedule)
+        message = (
+            f"{reason} for {pet_name}: needs {task.duration_minutes} min but only "
+            f"{max(0, remaining)} of {self.owner.available_minutes} min are free"
+        )
+        self._deferred.append(Issue(
+            kind="over_budget",
+            message=message,
+            pet_name=pet_name,
+            severity=Priority.HIGH,
+        ))
+        return f"deferred {message}"
+
+    @staticmethod
+    def _in_schedule(task: Task, schedule: List[Task]) -> bool:
+        """True when this exact task object is already in the schedule.
+
+        Compared by identity and id, never by title: two tasks may legitimately
+        share a title, and reusing one must not silently drop the other.
+        """
+        return any(t is task or t.id == task.id for t in schedule)
+
+    def _unscheduled_match(self, pet: Pet, keyword: str,
+                           schedule: List[Task]) -> Optional[Task]:
+        """A pending task of this pet covering `keyword` but absent from the plan.
+
+        This is what stops the Executor from fabricating a second 'Walk Rex'
+        when the pet already owns an 'Evening walk' that the time budget pushed
+        out of the plan. Prefers an already-timed task so the owner's intended
+        time is kept.
+        """
+        candidates = [
+            t for t in pet.tasks
+            if not t.is_completed
+            and _matches(t, keyword)
+            and not self._in_schedule(t, schedule)
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda t: (t.preferred_time is None,
+                                       t.preferred_time or time.max))
+        return candidates[0]
 
     # -- 1. Planner ------------------------------------------------------
 
@@ -473,9 +631,16 @@ class PetCareAgent:
         """Analyze the schedule for missing care steps and time conflicts.
 
         The Planner only diagnoses; it never edits the schedule. It reports:
-          * missing_care - a required step for a pet is absent from the schedule
-          * untimed      - a task has no preferred_time, so it cannot be checked
-          * conflict     - two tasks overlap in the clock
+          * missing_care      - the pet owns no task covering a required step
+          * unscheduled_care  - the pet owns one, but it is not in today's plan
+            (the Scheduler trimmed it to fit the time budget)
+          * untimed           - a task has no preferred_time, so it cannot be checked
+          * conflict          - two tasks overlap in the clock
+
+        The missing_care / unscheduled_care split matters: a required step is
+        only *missing* when the pet genuinely has no such task. Judging that
+        against the budget-trimmed schedule alone made the Executor invent a
+        duplicate of a task the pet already owned, once per run.
 
         Returns the issues found, highest severity first.
         """
@@ -484,7 +649,21 @@ class PetCareAgent:
         for pet in self.owner.pets:
             pet_tasks = [t for t in schedule if t.pet_name == pet.name]
             for keyword in self._required_for(pet):
-                if not any(_matches(t, keyword) for t in pet_tasks):
+                if any(_matches(t, keyword) for t in pet_tasks):
+                    continue
+                # Not in the plan — but does the pet already own one?
+                existing = self._unscheduled_match(pet, keyword, schedule)
+                if existing is not None:
+                    issues.append(Issue(
+                        kind="unscheduled_care",
+                        message=(f"{pet.name} ({pet.species}) has a '{keyword}' task "
+                                 f"('{existing.title}') that is not in today's plan"),
+                        pet_name=pet.name,
+                        task_id=existing.id,
+                        keyword=keyword,
+                        severity=Priority.HIGH,
+                    ))
+                else:
                     issues.append(Issue(
                         kind="missing_care",
                         message=f"{pet.name} ({pet.species}) has no '{keyword}' task scheduled",
@@ -527,18 +706,68 @@ class PetCareAgent:
                 iteration: int) -> List[Task]:
         """Adjust or reorder tasks to resolve the Planner's issues.
 
-        Adds missing care tasks, gives untimed tasks a slot, and moves the later
-        task of each conflicting pair to the first free slot. Medication-style
+        Reuses tasks wherever it can: an existing task is pulled into the plan
+        or re-timed in place, and a new Task is only ever created when the pet
+        owns nothing that covers the required care. Gives untimed tasks a slot
+        and moves the later task of each conflicting pair. Medication-style
         tasks are pinned and never moved. Returns a new schedule list; the Task
         objects themselves are mutated in place so the Pet keeps the change.
         """
         working = list(schedule)
         actions: List[str] = []
+        # Rebuilt every pass, so a deferral that later becomes affordable is
+        # not carried around as a stale complaint.
+        self._deferred = []
 
-        # 2a. Add any missing care step.
+        # 2a-i. Pull care the pet already owns back into the plan, rather than
+        # creating a duplicate of it.
+        for issue in (i for i in issues if i.kind == "unscheduled_care"):
+            pet = self._pet(issue.pet_name)
+            if pet is None:
+                continue
+            task = next((t for t in pet.tasks if t.id == issue.task_id), None)
+            if task is None or self._in_schedule(task, working):
+                continue
+            if not self._fits_budget(task, working):
+                actions.append(
+                    self._defer(task, pet.name, working, f"'{task.title}'")
+                )
+                continue
+            if not isinstance(task.preferred_time, time):
+                task.preferred_time = self._free_slot(task, working) or SAFE_WINDOW[0]
+            working.append(task)
+            actions.append(
+                f"pulled existing '{task.title}' ({pet.name}) at "
+                f"{task.preferred_time:%H:%M} into the plan to cover "
+                f"'{issue.keyword}' care (no new task created)"
+            )
+
+        # 2a-ii. Create a care task only when the pet truly owns none.
         for issue in (i for i in issues if i.kind == "missing_care"):
             pet = self._pet(issue.pet_name)
             if pet is None:
+                continue
+            # Re-check against the live schedule: an earlier issue in this same
+            # pass may already have covered this keyword.
+            if any(t.pet_name == pet.name and _matches(t, issue.keyword)
+                   for t in working):
+                continue
+            existing = self._unscheduled_match(pet, issue.keyword, working)
+            if existing is not None:
+                if not self._fits_budget(existing, working):
+                    actions.append(
+                        self._defer(existing, pet.name, working, f"'{existing.title}'")
+                    )
+                    continue
+                if not isinstance(existing.preferred_time, time):
+                    existing.preferred_time = (
+                        self._free_slot(existing, working) or SAFE_WINDOW[0]
+                    )
+                working.append(existing)
+                actions.append(
+                    f"reused existing '{existing.title}' ({pet.name}) at "
+                    f"{existing.preferred_time:%H:%M} for '{issue.keyword}' care"
+                )
                 continue
             new_task = Task(
                 title=f"{issue.keyword.capitalize()} {pet.name}",
@@ -546,6 +775,11 @@ class PetCareAgent:
                 priority=Priority.HIGH,
                 frequency=Frequency.DAILY,
             )
+            if not self._fits_budget(new_task, working):
+                actions.append(self._defer(
+                    new_task, pet.name, working, f"'{issue.keyword}' care"
+                ))
+                continue
             pet.add_task(new_task)
             new_task.preferred_time = self._free_slot(new_task, working) or SAFE_WINDOW[0]
             working.append(new_task)
@@ -579,12 +813,31 @@ class PetCareAgent:
                 key=lambda t: t.preferred_time,
             )
             if len(feedings) < 2:
+                # Prefer a feeding the pet already owns but that is not in the
+                # plan; only invent one when there is genuinely nothing to use.
+                spare = self._unscheduled_match(pet, "feed", working)
+                if spare is not None and self._fits_budget(spare, working):
+                    slot = self._spaced_feeding_slot(spare, working, feedings)
+                    if slot is not None:
+                        spare.preferred_time = slot
+                        working.append(spare)
+                        actions.append(
+                            f"pulled existing '{spare.title}' ({pet.name}) into the "
+                            f"plan at {slot:%H:%M} as the second feeding "
+                            "(no new task created)"
+                        )
+                        continue
                 new_task = Task(
                     title=f"Second feed {pet.name}",
                     duration_minutes=15,
                     priority=Priority.HIGH,
                     frequency=Frequency.DAILY,
                 )
+                if not self._fits_budget(new_task, working):
+                    actions.append(self._defer(
+                        new_task, pet.name, working, "a second feeding"
+                    ))
+                    continue
                 pet.add_task(new_task)
                 # A supplementary feeding belongs roughly half a day from the
                 # one that already exists, not just past the minimum gap.
@@ -649,7 +902,21 @@ class PetCareAgent:
                 "to clear an overlap"
             )
 
-        # 2d. Reorder the schedule chronologically so it reads as a day plan.
+        # 2d. Safety net: never hand on a list holding the same task twice.
+        # Each stage above already reuses rather than duplicates, but the
+        # Evaluator's carried issues are replayed on the next pass, so this
+        # guarantees the invariant no matter which path added a task.
+        seen: set = set()
+        deduped: List[Task] = []
+        for task in working:
+            if task.id in seen:
+                actions.append(f"dropped a duplicate entry for '{task.title}'")
+                continue
+            seen.add(task.id)
+            deduped.append(task)
+        working = deduped
+
+        # 2e. Reorder the schedule chronologically so it reads as a day plan.
         working = self.scheduler.sort_by_time(working)
         self._record(
             iteration, "EXECUTOR",
@@ -665,11 +932,26 @@ class PetCareAgent:
 
         Safety: every feeding, walk and medication falls inside SAFE_WINDOW, and
         no two tasks overlap. Nutrition: each pet gets at least two feedings,
-        spaced by at least MIN_FEEDING_GAP_MINUTES.
+        spaced by at least MIN_FEEDING_GAP_MINUTES. Capacity: the plan stays
+        inside the owner's available time, and any care the Executor had to
+        defer for lack of time is reported rather than quietly dropped.
 
         Returns the remaining violations; empty means the schedule passes.
         """
         issues: List[Issue] = []
+
+        # Capacity: the plan must not ask for more time than the owner has.
+        committed = self._committed_minutes(schedule)
+        if committed > self.owner.available_minutes:
+            issues.append(Issue(
+                kind="over_budget",
+                message=(f"the plan commits {committed} min but only "
+                         f"{self.owner.available_minutes} min are available"),
+                severity=Priority.HIGH,
+            ))
+        # Care the Executor could not fit needs a human decision: more time,
+        # or fewer tasks.
+        issues.extend(self._deferred)
 
         # Safety: nothing left overlapping.
         for a, b in self.scheduler.detect_conflicts(schedule):
@@ -797,6 +1079,7 @@ class PetCareAgent:
         self.log = []
         self.approved = False
         self.iterations_used = 0
+        self._deferred = []
         self.started_at = datetime.now()
         self.finished_at = None
         schedule = list(self.scheduler.generate_plan(today))
