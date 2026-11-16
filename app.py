@@ -4,6 +4,7 @@ import streamlit as st
 
 from pawpal_system import (
     AI_LOG_PATH,
+    IDEAL_FEEDING_GAP_MINUTES,
     MIN_FEEDING_GAP_MINUTES,
     SAFE_WINDOW,
     Frequency,
@@ -73,6 +74,70 @@ STAGE_ICONS = {
     "EVALUATOR": "🔍",
     "REFLECTOR": "🪞",
 }
+
+#: What each stage is for, shown under its heading in the audit trail.
+STAGE_BLURBS = {
+    "INPUT": "The draft plan the Scheduler handed to the agent.",
+    "PLANNER": "Diagnosed the schedule — it reports problems, it never edits.",
+    "EXECUTOR": "Applied fixes: added missing care, re-timed clashes, reordered the day.",
+    "EVALUATOR": "Re-checked the result against safety and nutrition rules.",
+    "REFLECTOR": "Decided whether to approve the schedule or run another pass.",
+}
+
+#: Plain-English labels and icons for the issue kinds the loop reports, so the
+#: trail reads as sentences instead of `[HIGH] missing_care: ...` dumps.
+ISSUE_KINDS = {
+    "missing_care": ("🚫", "Missing care"),
+    "conflict": ("⏱️", "Overlap"),
+    "feeding_gap": ("🍽️", "Feeding gap"),
+    "unsafe_time": ("🌙", "Unsafe time"),
+    "untimed": ("❓", "No time set"),
+}
+
+SEVERITY_ICONS = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡"}
+
+#: Verbs the Executor starts its action lines with, mapped to an icon.
+ACTION_ICONS = {
+    "added": "➕",
+    "scheduled": "🕒",
+    "moved": "↔️",
+    "could not": "⚠️",
+    "left": "📌",
+    "no adjustments": "✅",
+}
+
+
+def parse_detail(detail: str):
+    """Split one log detail into (icon, label, text) for readable rendering.
+
+    Issue lines arrive as ``[SEVERITY] kind: message`` from ``Issue.__str__``;
+    Executor lines are plain sentences. Anything unrecognised falls through
+    unchanged rather than being dropped.
+    """
+    if detail.startswith("[") and "] " in detail:
+        severity, rest = detail[1:].split("] ", 1)
+        kind, _, message = rest.partition(": ")
+        icon, label = ISSUE_KINDS.get(kind, ("•", kind.replace("_", " ").title()))
+        badge = SEVERITY_ICONS.get(severity.upper(), "")
+        return icon, f"{badge} {label}".strip(), message or rest
+    lowered = detail.lower()
+    for prefix, icon in ACTION_ICONS.items():
+        if lowered.startswith(prefix):
+            return icon, "", detail
+    return "•", "", detail
+
+
+def render_details(details):
+    """Render a step's details as readable markdown lines."""
+    if not details:
+        st.caption("No details recorded for this step.")
+        return
+    for detail in details:
+        icon, label, text = parse_detail(detail)
+        if label:
+            st.markdown(f"{icon} **{label}** — {text}")
+        else:
+            st.markdown(f"{icon} {text}")
 
 
 def task_rows(tasks):
@@ -169,9 +234,19 @@ with st.sidebar:
     st.divider()
 
     st.markdown("#### 🤖 Agentic review")
-    st.caption(
-        "Planner → Executor → Evaluator → Reflector checks the schedule for "
-        "missing care steps, clashes and feeding gaps, then fixes what it can."
+    st.info(
+        "**Run this before you finalise your day.** The 4-stage AI loop reads "
+        "your schedule and automatically:\n\n"
+        "- 🚫 **detects missing care** — every pet gets food, water and its "
+        "species' daily essentials\n"
+        "- ⏱️ **catches overlapping tasks** — no two jobs booked at the same minute\n"
+        f"- 🍽️ **enforces nutrition safety** — at least 2 feedings a pet, spaced "
+        f"{MIN_FEEDING_GAP_MINUTES // 60}+ hours apart\n"
+        f"- 🌙 **keeps care in waking hours** — {SAFE_WINDOW[0]:%H:%M}–"
+        f"{SAFE_WINDOW[1]:%H:%M}\n\n"
+        "It then fixes what it safely can and shows you its full reasoning in "
+        "the **Agentic Review** tab.",
+        icon="💡",
     )
     st.warning(
         "This edits your schedule: it can add missing care tasks and move "
@@ -179,9 +254,22 @@ with st.sidebar:
         icon="⚠️",
     )
     max_iterations = int(
-        st.number_input("Max iterations", min_value=1, max_value=10, value=3)
+        st.number_input(
+            "Max iterations",
+            min_value=1,
+            max_value=10,
+            value=3,
+            help="How many Planner → Executor → Evaluator → Reflector passes the "
+            "agent may spend. It stops early once the schedule passes, or when "
+            "a pass makes no progress.",
+        )
     )
-    run_review = st.button("Run agentic review", type="primary", use_container_width=True)
+    run_review = st.button(
+        "Run agentic review",
+        type="primary",
+        use_container_width=True,
+        help="Audits and repairs today's schedule, then logs the full reasoning trail.",
+    )
 
 # ---------------------------------------------------------------------------
 # Agentic run (triggered from the sidebar, executed before the main view draws)
@@ -375,8 +463,10 @@ with tab_schedule:
 with tab_review:
     if agent is None:
         st.info(
-            "No review yet. Use **Run agentic review** in the sidebar to start the "
-            "Planner → Executor → Evaluator → Reflector loop."
+            "**No review yet.** Use **Run agentic review** in the sidebar to let the "
+            "4-stage loop detect missing pet care, catch overlapping tasks and check "
+            "nutritional safety before you finalise your day.",
+            icon="💡",
         )
         st.markdown(
             "**What each stage does**\n"
@@ -408,18 +498,29 @@ with tab_review:
 
         with trail:
             st.subheader("Audit trail")
+            st.caption(
+                "Every stage of every iteration, in the order the agent ran them."
+            )
+            current_iteration = None
             for step in agent.log:
+                if step.iteration != current_iteration:
+                    current_iteration = step.iteration
+                    st.markdown(
+                        f"**Iteration {step.iteration}**"
+                        if step.iteration
+                        else "**Starting point**"
+                    )
                 icon = STAGE_ICONS.get(step.stage, "•")
-                label = (
-                    f"{icon} Iteration {step.iteration} · {step.stage.title()} "
-                    f"— {step.summary}"
-                )
+                label = f"{icon} {step.stage.title()} — {step.summary}"
                 # The verdict opens by default; the rest stay collapsed so a
                 # long run is still readable.
                 with st.expander(label, expanded=step.stage == "REFLECTOR"):
-                    st.caption(f"Logged at {step.timestamp:%H:%M:%S}")
-                    for detail in step.details:
-                        st.markdown(f"- {detail}")
+                    blurb = STAGE_BLURBS.get(step.stage)
+                    if blurb:
+                        st.caption(f"{blurb}  ·  logged at {step.timestamp:%H:%M:%S}")
+                    else:
+                        st.caption(f"Logged at {step.timestamp:%H:%M:%S}")
+                    render_details(step.details)
 
         with revised:
             st.subheader("Revised schedule")
@@ -499,7 +600,12 @@ with tab_insights:
     st.subheader("Care rules the agent enforces")
     r1, r2, r3 = st.columns(3)
     r1.metric("Safe window", f"{SAFE_WINDOW[0]:%H:%M}–{SAFE_WINDOW[1]:%H:%M}")
-    r2.metric("Min feeding gap", f"{MIN_FEEDING_GAP_MINUTES} min")
+    r2.metric(
+        "Min feeding gap",
+        f"{MIN_FEEDING_GAP_MINUTES // 60}h",
+        delta=f"targets {IDEAL_FEEDING_GAP_MINUTES // 60}h spacing",
+        delta_color="off",
+    )
     r3.metric("Min feedings / pet", 2)
     st.caption(
         "Required daily care — dog: feed, water, walk · cat: feed, water, litter · "

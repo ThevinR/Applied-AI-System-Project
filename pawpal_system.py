@@ -270,8 +270,16 @@ REQUIRED_CARE: Dict[str, Tuple[str, ...]] = {
 DEFAULT_REQUIRED_CARE: Tuple[str, ...] = ("feed", "water")
 
 #: Minimum gap between two feedings for the same pet, so a day's food is not
-#: served all at once (a bloat / overfeeding risk).
-MIN_FEEDING_GAP_MINUTES = 240
+#: served all at once (a bloat / overfeeding risk). Six hours is the usual
+#: floor for a twice-a-day feeding routine.
+MIN_FEEDING_GAP_MINUTES = 360
+#: What the Executor aims for when it places a supplementary feeding: roughly
+#: half the waking day, so morning and evening meals sit opposite each other.
+#: The Evaluator only enforces the minimum; this is the target, not a rule.
+IDEAL_FEEDING_GAP_MINUTES = 420
+#: Feedings are also kept away from the far ends of the safe window, so an
+#: evenly spaced meal does not land at the very edge of the day.
+FEEDING_WINDOW = (time(6, 30), time(21, 0))
 #: Feeding, walking and medication should fall inside waking hours.
 SAFE_WINDOW = (time(6, 0), time(22, 0))
 #: Medication is time-critical: the executor will not move it.
@@ -410,6 +418,55 @@ class PetCareAgent:
                 return candidate
         return None
 
+    def _spaced_feeding_slot(self, task: Task, schedule: List[Task],
+                             others: List[Task]) -> Optional[time]:
+        """Place a feeding so the pet's meals are spread evenly across the day.
+
+        `_free_slot` takes the *first* candidate that merely clears the minimum
+        gap, which tends to park a second meal just past the threshold and
+        leave the rest of the day empty. This instead scores every free slot in
+        the feeding window by its distance to the nearest existing feeding,
+        discards anything closer than MIN_FEEDING_GAP_MINUTES, and keeps the
+        slot whose spacing is nearest IDEAL_FEEDING_GAP_MINUTES — so a 07:00
+        breakfast gets a 14:00-ish second meal rather than an 11:00 one.
+
+        Args:
+            task: The feeding to place.
+            schedule: The current schedule, used for clash detection.
+            others: The pet's other timed feedings, used as spacing anchors.
+
+        Returns:
+            The best slot, or None when no slot is both free and far enough
+            from every existing feeding.
+        """
+        busy = self._occupied(schedule, exclude=task)
+        low, high = _minutes(FEEDING_WINDOW[0]), _minutes(FEEDING_WINDOW[1])
+        anchors = [
+            _minutes(f.preferred_time)
+            for f in others
+            if f is not task and isinstance(f.preferred_time, time)
+        ]
+        best: Optional[time] = None
+        best_key: Optional[tuple] = None
+        for candidate in _FALLBACK_SLOTS:
+            start = _minutes(candidate)
+            end = start + task.duration_minutes
+            if start < low or end > high:
+                continue
+            if any(start < b_end and b_start < end for b_start, b_end in busy):
+                continue
+            if not anchors:
+                return candidate
+            gap = min(abs(start - anchor) for anchor in anchors)
+            if gap < MIN_FEEDING_GAP_MINUTES:
+                continue
+            # Closest to the ideal spacing wins; ties go to the earlier slot so
+            # the result is deterministic.
+            key = (abs(gap - IDEAL_FEEDING_GAP_MINUTES), start)
+            if best_key is None or key < best_key:
+                best_key, best = key, candidate
+        return best
+
     # -- 1. Planner ------------------------------------------------------
 
     def plan(self, schedule: List[Task], iteration: int) -> List[Issue]:
@@ -529,14 +586,9 @@ class PetCareAgent:
                     frequency=Frequency.DAILY,
                 )
                 pet.add_task(new_task)
-                avoid = [
-                    (_minutes(f.preferred_time) - MIN_FEEDING_GAP_MINUTES,
-                     _minutes(f.preferred_time) + MIN_FEEDING_GAP_MINUTES)
-                    for f in feedings
-                ]
-                # A supplementary feeding belongs on the far side of the day from
-                # the one that already exists, so search later slots first.
-                slot = self._free_slot(new_task, working, avoid=avoid, late_first=True)
+                # A supplementary feeding belongs roughly half a day from the
+                # one that already exists, not just past the minimum gap.
+                slot = self._spaced_feeding_slot(new_task, working, feedings)
                 if slot is None:
                     pet.remove_task(new_task.id)
                     actions.append(
@@ -546,8 +598,14 @@ class PetCareAgent:
                     continue
                 new_task.preferred_time = slot
                 working.append(new_task)
+                gap = (
+                    min(abs(_minutes(slot) - _minutes(f.preferred_time)) for f in feedings)
+                    if feedings else None
+                )
+                spacing = f", {gap // 60}h{gap % 60:02d} after the first" if gap else ""
                 actions.append(
-                    f"added '{new_task.title}' at {slot:%H:%M} so {pet.name} gets two feedings"
+                    f"added '{new_task.title}' at {slot:%H:%M}{spacing} "
+                    f"so {pet.name} gets two evenly spaced feedings"
                 )
                 continue
 
@@ -555,13 +613,8 @@ class PetCareAgent:
             if mover is None or _is_pinned(mover):
                 continue
             others = [f for f in feedings if f is not mover]
-            avoid = [
-                (_minutes(f.preferred_time) - MIN_FEEDING_GAP_MINUTES,
-                 _minutes(f.preferred_time) + MIN_FEEDING_GAP_MINUTES)
-                for f in others
-            ]
             old = mover.preferred_time
-            slot = self._free_slot(mover, working, avoid=avoid)
+            slot = self._spaced_feeding_slot(mover, working, others)
             if slot is None:
                 actions.append(
                     f"could not re-space '{mover.title}' ({pet.name}): no slot far "
@@ -569,9 +622,12 @@ class PetCareAgent:
                 )
                 continue
             mover.preferred_time = slot
+            gap = min(
+                abs(_minutes(slot) - _minutes(f.preferred_time)) for f in others
+            )
             actions.append(
                 f"moved '{mover.title}' ({pet.name}) {old:%H:%M} -> {slot:%H:%M} "
-                "to space out feedings"
+                f"to space out feedings ({gap // 60}h{gap % 60:02d} apart)"
             )
 
         # 2c. Resolve overlaps, moving the later-listed task of each pair.
