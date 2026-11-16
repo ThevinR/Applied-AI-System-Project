@@ -236,3 +236,69 @@
 17:00  Timmy: Feed Timmy (15 min)
 18:00  Noir: Walk Noir (15 min)
 ```
+
+### Run 2026-11-15 20:03:54 — NEEDS REVIEW
+
+- **Source:** streamlit app
+- **Owner:** Jordan (10 min available)
+- **Pets:** Mochi (dog), Timmy (cat)
+- **Iterations used:** 1 of 1
+- **Started / finished:** 20:03:54 → 20:03:54 (0.4 ms)
+- **Final schedule:** 6 task(s)
+
+**Reasoning trace**
+
+| Time | Iter | Stage | Summary | Details |
+| --- | --- | --- | --- | --- |
+| 20:03:54 | 0 | INPUT | draft plan from Scheduler: 0 task(s) | nothing pending to schedule |
+| 20:03:54 | 1 | PLANNER | analyzed 0 task(s); found 6 issue(s) | [HIGH] missing_care: Mochi (dog) has no 'feed' task scheduled<br>[HIGH] missing_care: Mochi (dog) has no 'water' task scheduled<br>[HIGH] missing_care: Mochi (dog) has no 'walk' task scheduled<br>[HIGH] missing_care: Timmy (cat) has no 'feed' task scheduled<br>[HIGH] missing_care: Timmy (cat) has no 'water' task scheduled<br>[HIGH] missing_care: Timmy (cat) has no 'litter' task scheduled |
+| 20:03:54 | 1 | EXECUTOR | applied 6 adjustment(s) | added 'Feed Mochi' at 07:00 (missing 'feed' care for Mochi)<br>added 'Water Mochi' at 07:30 (missing 'water' care for Mochi)<br>added 'Walk Mochi' at 08:00 (missing 'walk' care for Mochi)<br>added 'Feed Timmy' at 17:00 (missing 'feed' care for Timmy)<br>added 'Water Timmy' at 16:00 (missing 'water' care for Timmy)<br>added 'Litter Timmy' at 09:00 (missing 'litter' care for Timmy) |
+| 20:03:54 | 1 | EVALUATOR | safety + nutrition check: FAIL (2 violation(s)) | [HIGH] feeding_gap: Mochi has 1 feeding(s); at least 2 are expected<br>[HIGH] feeding_gap: Timmy has 1 feeding(s); at least 2 are expected |
+| 20:03:54 | 1 | REFLECTOR | NOT APPROVED - iteration budget (1) exhausted | [HIGH] feeding_gap: Mochi has 1 feeding(s); at least 2 are expected<br>[HIGH] feeding_gap: Timmy has 1 feeding(s); at least 2 are expected |
+
+**Final schedule**
+
+```
+07:00  Mochi: Feed Mochi (15 min)
+07:30  Mochi: Water Mochi (15 min)
+08:00  Mochi: Walk Mochi (15 min)
+09:00  Timmy: Litter Timmy (15 min)
+16:00  Timmy: Water Timmy (15 min)
+17:00  Timmy: Feed Timmy (15 min)
+```
+
+### Run 2026-11-15 20:04:08 — APPROVED
+
+- **Source:** streamlit app
+- **Owner:** Jordan (10 min available)
+- **Pets:** Mochi (dog), Timmy (cat)
+- **Iterations used:** 2 of 4
+- **Started / finished:** 20:04:08 → 20:04:08 (0.5 ms)
+- **Final schedule:** 8 task(s)
+
+**Reasoning trace**
+
+| Time | Iter | Stage | Summary | Details |
+| --- | --- | --- | --- | --- |
+| 20:04:08 | 0 | INPUT | draft plan from Scheduler: 0 task(s) | nothing pending to schedule |
+| 20:04:08 | 1 | PLANNER | analyzed 0 task(s); found 6 issue(s) | [HIGH] missing_care: Mochi (dog) has no 'feed' task scheduled<br>[HIGH] missing_care: Mochi (dog) has no 'water' task scheduled<br>[HIGH] missing_care: Mochi (dog) has no 'walk' task scheduled<br>[HIGH] missing_care: Timmy (cat) has no 'feed' task scheduled<br>[HIGH] missing_care: Timmy (cat) has no 'water' task scheduled<br>[HIGH] missing_care: Timmy (cat) has no 'litter' task scheduled |
+| 20:04:08 | 1 | EXECUTOR | applied 6 adjustment(s) | added 'Feed Mochi' at 07:00 (missing 'feed' care for Mochi)<br>added 'Water Mochi' at 07:30 (missing 'water' care for Mochi)<br>added 'Walk Mochi' at 08:00 (missing 'walk' care for Mochi)<br>added 'Feed Timmy' at 17:00 (missing 'feed' care for Timmy)<br>added 'Water Timmy' at 16:00 (missing 'water' care for Timmy)<br>added 'Litter Timmy' at 09:00 (missing 'litter' care for Timmy) |
+| 20:04:08 | 1 | EVALUATOR | safety + nutrition check: FAIL (2 violation(s)) | [HIGH] feeding_gap: Mochi has 1 feeding(s); at least 2 are expected<br>[HIGH] feeding_gap: Timmy has 1 feeding(s); at least 2 are expected |
+| 20:04:08 | 1 | REFLECTOR | REVISE - 2 issue(s) left, running another iteration | [HIGH] feeding_gap: Mochi has 1 feeding(s); at least 2 are expected<br>[HIGH] feeding_gap: Timmy has 1 feeding(s); at least 2 are expected |
+| 20:04:08 | 2 | PLANNER | analyzed 6 task(s); found 0 issue(s) | schedule looks complete and conflict-free |
+| 20:04:08 | 2 | EXECUTOR | applied 2 adjustment(s) | added 'Second feed Mochi' at 12:00 so Mochi gets two feedings<br>added 'Second feed Timmy' at 21:30 so Timmy gets two feedings |
+| 20:04:08 | 2 | EVALUATOR | safety + nutrition check: PASS | all safety and nutritional goals met |
+| 20:04:08 | 2 | REFLECTOR | APPROVED - schedule is safe, complete and well spaced | no outstanding issues; ending the loop |
+
+**Final schedule**
+
+```
+07:00  Mochi: Feed Mochi (15 min)
+07:30  Mochi: Water Mochi (15 min)
+08:00  Mochi: Walk Mochi (15 min)
+09:00  Timmy: Litter Timmy (15 min)
+12:00  Mochi: Second feed Mochi (15 min)
+16:00  Timmy: Water Timmy (15 min)
+17:00  Timmy: Feed Timmy (15 min)
+21:30  Timmy: Second feed Timmy (15 min)
+```
