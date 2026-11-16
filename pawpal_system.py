@@ -795,9 +795,10 @@ AUTO_LOG_HEADING = "## Agentic Loop Run Log (auto-generated)"
 _AUTO_LOG_INTRO = (
     "\n\n---\n\n"
     f"{AUTO_LOG_HEADING}\n\n"
-    "> Appended automatically by `PetCareAgent` on every run from the Streamlit\n"
-    "> app or `main.py`. Each entry records the stage-by-stage reasoning trace,\n"
-    "> timestamps and the Reflector's verdict. Do not hand-edit below this line.\n"
+    "> Appended automatically by `log_agent_run()` every time the agentic review\n"
+    "> runs in the Streamlit app. Each entry records the stage-by-stage reasoning\n"
+    "> trace, timestamps and the Reflector's verdict. Do not hand-edit below this\n"
+    "> line.\n"
 )
 
 

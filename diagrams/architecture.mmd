@@ -1,0 +1,96 @@
+%% PawPal+ system architecture
+%% Shows the Streamlit UI, the core domain/scheduling logic, the four-stage
+%% agentic loop with its verification feedback paths, and the run log output.
+%% Source of truth: app.py and pawpal_system.py.
+flowchart TD
+
+    %% ---------------------------------------------------------------
+    subgraph UI["Streamlit UI — app.py"]
+        direction TB
+        FORMS["Owner / Pet / Task forms<br>add pets, add tasks, complete tasks"]
+        VIEWS["Task table + conflict warnings<br>filter by pet / status, sort by priority or time"]
+        BUILD["'Generate schedule' button<br>shows plan, skipped tasks, explain_plan()"]
+        REVIEW["Sidebar: 'Run Agentic Review'<br>max iterations + trigger"]
+        TRAIL["Audit trail UI<br>verdict banner, metrics,<br>one expander per loop step,<br>revised schedule table"]
+    end
+
+    %% ---------------------------------------------------------------
+    subgraph CORE["Core Logic — pawpal_system.py"]
+        direction TB
+        OWNER["Owner<br>name, available_minutes, pets"]
+        PET["Pet<br>name, species, tasks"]
+        TASK["Task<br>title, duration, priority,<br>preferred_time, frequency, due_date"]
+        SCHED["Scheduler<br>get_tasks / filter_tasks / sort_tasks<br>detect_conflicts / generate_plan"]
+        RULES["Care rules<br>REQUIRED_CARE per species<br>SAFE_WINDOW, MIN_FEEDING_GAP_MINUTES<br>PINNED_KEYWORDS"]
+    end
+
+    %% ---------------------------------------------------------------
+    subgraph AGENT["Agentic Loop — PetCareAgent.run()"]
+        direction TB
+        DRAFT["Draft plan<br>Scheduler.generate_plan()"]
+        PLANNER["1. PLANNER — diagnose<br>missing care steps, untimed tasks,<br>time conflicts → List[Issue]"]
+        EXECUTOR["2. EXECUTOR — repair<br>add missing care, assign slots,<br>re-time overlaps, space feedings,<br>reorder chronologically"]
+        EVALUATOR["3. EVALUATOR — verify<br>safety: no overlaps, inside SAFE_WINDOW<br>nutrition: 2+ feedings, 4h+ apart"]
+        REFLECTOR{"4. REFLECTOR — decide<br>approve, revise,<br>or stop"}
+        FINAL["Final schedule<br>agent.schedule + agent.approved"]
+    end
+
+    %% ---------------------------------------------------------------
+    subgraph LOGOUT["Run Logging"]
+        direction TB
+        FORMAT["format_agent_run()<br>stage trace, timestamps, elapsed ms"]
+        WRITER["log_agent_run()<br>appends under<br>'Agentic Loop Run Log (auto-generated)'"]
+        MDFILE[("ai_interactions.md<br>project root<br>hand-written notes preserved")]
+    end
+
+    %% --- UI to core ------------------------------------------------
+    FORMS -->|"creates / mutates"| OWNER
+    VIEWS -->|"reads via"| SCHED
+    BUILD -->|"generate_plan()"| SCHED
+
+    %% --- domain model ----------------------------------------------
+    OWNER -->|"1..*"| PET
+    PET -->|"1..*"| TASK
+    SCHED -->|"get_all_tasks()"| OWNER
+
+    %% --- triggering the loop ---------------------------------------
+    REVIEW -->|"PetCareAgent(owner, scheduler).run()"| DRAFT
+    SCHED -->|"pending tasks due today"| DRAFT
+
+    %% --- the loop ---------------------------------------------------
+    DRAFT --> PLANNER
+    PLANNER -->|"issues"| EXECUTOR
+    EXECUTOR -->|"revised schedule"| EVALUATOR
+    EVALUATOR -->|"remaining violations"| REFLECTOR
+
+    %% --- knowledge the stages reason against ------------------------
+    RULES -.->|"required care per species"| PLANNER
+    RULES -.->|"safe slots, pinned tasks"| EXECUTOR
+    RULES -.->|"safety + nutrition goals"| EVALUATOR
+
+    %% --- the agent writes back to the real objects ------------------
+    EXECUTOR -->|"adds Tasks, edits preferred_time"| PET
+
+    %% --- feedback paths ---------------------------------------------
+    REFLECTOR -->|"REVISE: carry violations<br>into the next iteration"| PLANNER
+    REFLECTOR -->|"APPROVED / budget spent /<br>no progress made"| FINAL
+
+    %% --- outputs -----------------------------------------------------
+    FINAL -->|"agent.log (LoopStep records)"| TRAIL
+    FINAL --> FORMAT
+    FORMAT --> WRITER
+    WRITER -->|"append on every run"| MDFILE
+    WRITER -.->|"OSError surfaced as st.error"| TRAIL
+
+    %% ---------------------------------------------------------------
+    classDef ui fill:#E3F2FD,stroke:#1565C0,color:#0D1B2A
+    classDef core fill:#E8F5E9,stroke:#2E7D32,color:#0D1B2A
+    classDef agent fill:#FFF3E0,stroke:#EF6C00,color:#0D1B2A
+    classDef log fill:#F3E5F5,stroke:#6A1B9A,color:#0D1B2A
+    classDef decision fill:#FFE0B2,stroke:#E65100,color:#0D1B2A
+
+    class FORMS,VIEWS,BUILD,REVIEW,TRAIL ui
+    class OWNER,PET,TASK,SCHED,RULES core
+    class DRAFT,PLANNER,EXECUTOR,EVALUATOR,FINAL agent
+    class REFLECTOR decision
+    class FORMAT,WRITER,MDFILE log
