@@ -8,7 +8,27 @@ PawPal+ began as the **CodePath Module 2 project**: a Streamlit app that helps a
 
 PawPal+ turns a list of pet care tasks into a daily schedule and then **reviews its own work**. The scheduler produces a draft plan; a four-stage agent (**Planner → Executor → Evaluator → Reflector**) then finds missing care steps, overlapping times and feeding problems, fixes what it safely can, re-checks the result, and either approves the schedule or escalates the remainder to the human. Every review writes a timestamped reasoning trace to `ai_interactions.md`, so each decision the agent made can be audited after the fact.
 
-The system is **fully deterministic and rule-based** — no LLM or external API is involved. The "AI" here is the agentic control loop and the domain rules it reasons against, which means every run is reproducible and every decision is explainable by reading the code.
+**Every scheduling decision is deterministic and rule-based.** Google Gemini is layered on top to narrate the audit trail in plain English and to *propose* slots for missing care — but a proposal is only used if it passes the same validation a rule-chosen slot faces, and the whole system runs unchanged with no API key at all. The "AI" here is the agentic control loop and the domain rules it reasons against, augmented (never governed) by an LLM, which means every scheduling outcome is reproducible and explainable by reading the code.
+
+**User-first.** A time you type is a commitment: the agent plans *around* your times and never silently moves them.
+
+---
+
+## 🤖 The AI feature (rubric: Agentic Workflow + Reliability)
+
+PawPal+ implements **two** of the required AI features, both integrated into the main
+application logic rather than bolted on as scripts:
+
+1. **Agentic workflow** — a four-stage Planner → Executor → Evaluator → Reflector loop
+   that plans, acts, verifies its own work, and decides whether to iterate again or
+   escalate to the human. It genuinely edits the schedule; it is not a dry run.
+2. **Reliability / testing system** — 35 automated tests, a randomised fuzz harness
+   (400 configs × 8 runs), explicit guardrails (time budget, user-time locking,
+   medication pinning), and a validation gate that re-checks every LLM suggestion.
+
+Google Gemini (`google-genai`) augments the loop with plain-English audit commentary
+and AI-proposed scheduling slots — always **advisory**, never authoritative. See
+[§4 of the architecture](#4-ai-augmentation-layer--google-gemini-google-genai).
 
 ---
 
@@ -38,7 +58,7 @@ The loop starts from `Scheduler.generate_plan()` and cycles up to `max_iteration
 |---|---|---|
 | **1. Planner** | Diagnose | Reads the schedule and emits `Issue` objects: required care steps missing for a species, tasks with no time, and overlapping time windows. **Never edits anything.** |
 | **2. Executor** | Repair | Acts on those issues: creates missing care tasks, assigns times to untimed tasks, moves the later task of each overlap, spaces out feedings, then reorders the day chronologically. |
-| **3. Evaluator** | Verify | Independently re-checks the *revised* schedule against goals the Executor was not told to optimise for — safety (no residual overlaps, time-critical care inside `SAFE_WINDOW`) and nutrition (at least two feedings, at least four hours apart). |
+| **3. Evaluator** | Verify | Independently re-checks the *revised* schedule against goals the Executor was not told to optimise for — safety (no residual overlaps, time-critical care inside `SAFE_WINDOW`) and nutrition (at least two feedings, at least six hours apart). |
 | **4. Reflector** | Decide | Approves, or sends the remaining violations round again, or stops and escalates. |
 
 Two edges in the diagram carry the parts that make this a genuine loop rather than a pipeline:
@@ -48,7 +68,29 @@ Two edges in the diagram carry the parts that make this a genuine loop rather th
 
 The Reflector stops on any of three conditions: nothing left to fix (**approved**), the iteration budget is spent, or an iteration made **no progress** (the same number of issues as the previous pass), which means further iterations would only repeat themselves.
 
-### 4. Run Logging — `ai_interactions.md`
+### 4. AI Augmentation Layer — Google Gemini (`google-genai`)
+
+The system calls Gemini through the official SDK (`from google import genai`,
+`client.models.generate_content()`) in two places. Both are **advisory**, and that
+boundary is the single most important design decision in the project:
+
+| Where | What the model does | What it is prevented from doing |
+|---|---|---|
+| **Planner / Reflector** | Narrates findings and the verdict in plain English for the audit trail | Changing a finding, or claiming a plan is safe when issues remain |
+| **Executor** | Proposes a clock time for a missing second feeding | Writing that time itself — every suggestion must pass `_slot_acceptable()` |
+
+`_slot_acceptable()` re-checks a proposed time against exactly the rules a rule-chosen
+slot must satisfy: inside a named day block, inside `SAFE_WINDOW`, no clash with an
+existing task, and at least `MIN_FEEDING_GAP_MINUTES` from every other feeding. A
+suggestion that fails is **logged as rejected** and the deterministic slot is used
+instead. A hallucinated time cannot reach a schedule.
+
+The layer is fully optional. With no `GEMINI_API_KEY`, no `google-genai` install, or a
+failed call, every method returns `""` and the loop behaves exactly as it does offline.
+The 35-test suite never touches the network, because `PetCareAgent` defaults to
+`commentator=None`.
+
+### 5. Run Logging — `ai_interactions.md`
 
 `format_agent_run()` renders a completed run as Markdown — source, owner, pets, iterations, start/finish timestamps and elapsed milliseconds, a per-step reasoning-trace table, and the final schedule. `log_agent_run()` appends it to `ai_interactions.md` in the project root under a dedicated `## Agentic Loop Run Log (auto-generated)` heading, leaving the hand-written notes above that heading untouched. The UI catches write failures and surfaces them as an error rather than losing the review.
 
@@ -90,20 +132,48 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**5. Verify the install**
+**5. Add a Gemini API key (optional)**
+
+The scheduler, the agentic loop and all guardrails work **without a key**. A key only
+adds plain-English commentary and AI-suggested slots.
+
+```bash
+cp .env.example .env     # then open .env and paste your key
+```
+
+```ini
+# .env  (gitignored - never committed)
+GEMINI_API_KEY=your-gemini-api-key-here
+GEMINI_MODEL=gemini-3.5-flash     # optional; this is the default
+```
+
+Get a key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
+Without one the app simply shows `⚪ AI commentary off` in the sidebar and runs
+rules-only.
+
+> **Free-tier quota:** Google's free tier allows **20 `generate_content` requests per
+> day**. One agentic review is capped at `LLM_MAX_CALLS_PER_RUN = 4`, so a key supports
+> roughly five reviews a day. Past that the API returns `429 RESOURCE_EXHAUSTED`, which
+> the system reports and absorbs — the schedule is still produced by the rules.
+
+**6. Verify the install**
 
 ```bash
 python -m pytest
 ```
 
-You should see `34 passed`.
+You should see `35 passed`.
 
 ### Running the app
 
 ```bash
 streamlit run app.py   # the full Streamlit app, opens in your browser
 python main.py         # headless CLI demo of the scheduler, no UI needed
+python demo.py         # all four evidence scenarios below, end to end
 ```
+
+`demo.py` regenerates every example in the next section. Its captured output is also
+committed as [`demo_output.txt`](demo_output.txt).
 
 To run an agentic review in the UI: add a pet and at least one task, then open the **sidebar** and click **Run Agentic Review**.
 
@@ -112,6 +182,59 @@ To run an agentic review in the UI: add a pet and at least one task, then open t
 ## 🔁 Reproducible Examples
 
 All three examples below are **real captured output**, not illustrations. Example 1 is fully deterministic. Examples 2 and 3 are deterministic in their reasoning and final schedule; only the wall-clock timestamps in the log differ between runs.
+
+### Example 0 — User-first scheduling: your times are never moved
+
+The most important behavioural guarantee. The owner types a 13:30 lunch and a 07:00
+walk; the agent fills the gaps **around** them and leaves both exactly where they were.
+
+```text
+INPUT (typed by the owner):
+  Timmy (dog) - Lunch feed 13:30 (30 min), Morning walk 07:00 (20 min)
+  Available time today: 600 min
+
+OUTPUT (after the agentic review):
+  07:00  Timmy    Morning walk            20 min  [set by you]
+  07:30  Timmy    Second feed Timmy       15 min  [set by agent]
+  13:30  Timmy    Lunch feed              30 min  [set by you]
+  18:00  Timmy    Water Timmy             15 min  [set by agent]
+
+  Lunch feed still at 13:30: True
+  Morning walk still at 07:00: True
+  Verdict: APPROVED
+
+  [Gemini / PLANNER] Timmy's schedule currently includes his morning walk and lunch
+  feed, but there is no water task scheduled for him today. Proper hydration is
+  essential for his health and overall wellbeing. Please add a water task to ensure
+  his daily care plan is complete and safe.
+```
+
+A task the owner leaves **untimed** is still placed by the agent — no preference was
+expressed, so there is nothing to override. Only an explicit time is treated as a
+commitment (`_is_user_fixed()`).
+
+### Example 0b — The LLM guardrail, suggestion by suggestion
+
+Gemini is asked where a second feeding belongs for a dog already fed at 13:30. Each
+reply is re-checked by `_slot_acceptable()` before it can be used. Reproduce with
+`python demo.py` (this scenario uses a stub model, so it needs no API key or quota):
+
+```text
+  Model says   Verdict    Placed at   Why
+  ---------------------------------------
+  19:30        ACCEPTED   19:30       6h00 after 13:30, inside evening block
+  07:30        ACCEPTED   07:30       6h00 before 13:30, inside morning block
+  19:00        REJECTED   07:30       only 5h30 from 13:30 - under the minimum
+  14:00        REJECTED   07:30       only 30 min from 13:30
+  02:00        REJECTED   07:30       outside the safe window and every block
+  banana       REJECTED   07:30       unparseable reply
+
+  A rejected suggestion falls back to the rule-chosen slot.
+  A hallucinated time can never reach the schedule.
+```
+
+Note `19:00` being rejected: it looks reasonable to a human, but 13:30 → 19:00 is
+5h30, under the 6-hour nutritional minimum. The rules catch what eyeballing misses.
 
 ### Example 1 — The scheduler alone (`python main.py`)
 
@@ -342,9 +465,15 @@ Every review run in the Streamlit app appends an entry like this (from a two-tas
 |---|---|---|
 | **Species-aware care checks** | Knows a dog needs feed/water/walk and a cat needs feed/water/litter, and flags any that are missing from the day. | `PetCareAgent.plan()`, `REQUIRED_CARE` |
 | **Automatic conflict repair** | Moves the later task of an overlapping pair to the first genuinely free slot, preferring sensible times for that kind of care. | `PetCareAgent.execute()`, `_free_slot()` |
-| **Pinned medication** | Tasks matching `PINNED_KEYWORDS` are never moved. If two pinned tasks clash, the agent says so instead of resolving it. | `_is_pinned()` |
+| **Pinned medication** | Tasks matching `PINNED_KEYWORDS` are never moved. If two pinned tasks clash, the agent says so instead of resolving it. | `_is_medication()` |
+| **User-first time locking** | A time the owner typed is a commitment: the agent schedules around it and never shifts it. Untimed tasks are still placed freely. | `_is_user_fixed()`, `Task.source` |
+| **Logical day blocks** | New care lands in morning (07:00-09:00), afternoon (13:00-15:00) or evening (18:00-20:00), choosing the least crowded suitable block. | `DAY_BLOCKS`, `_natural_slot()` |
+| **AI audit commentary** | Gemini narrates the Planner's findings and the Reflector's verdict in plain English for the owner. | `LLMCommentator`, `client.models.generate_content()` |
+| **AI-suggested slots, rule-validated** | Gemini proposes a time for a missing feeding; it is used only if it passes block, clash, spacing and safe-window checks. Accept/reject is logged. | `suggest_care_time()`, `_slot_acceptable()` |
+| **Time-budget guardrail** | The plan never commits more minutes than the owner has. Care that will not fit is reported, not silently dropped. | `_fits_budget()`, `_defer()` |
+| **Graceful LLM degradation** | Missing key, 429 quota, 504 timeout or unparseable output all fall back to rules with a clear message. | `LLMCommentator._generate()` |
 | **Safety verification** | Confirms feeding, walks and medication fall inside `SAFE_WINDOW` (06:00–22:00) and that nothing still overlaps. | `PetCareAgent.evaluate()` |
-| **Nutrition verification** | Requires at least two feedings per pet, at least `MIN_FEEDING_GAP_MINUTES` (4h) apart, and adds or re-spaces feedings to achieve it. | `PetCareAgent.evaluate()`, `PetCareAgent.execute()` |
+| **Nutrition verification** | Requires at least two feedings per pet, at least `MIN_FEEDING_GAP_MINUTES` (6h) apart, targeting ~7h, and adds or re-spaces feedings to achieve it. | `PetCareAgent.evaluate()`, `PetCareAgent.execute()` |
 | **Self-terminating iteration** | Stops on approval, on budget exhaustion, or on a no-progress iteration — it cannot spin forever. | `PetCareAgent.reflect()` |
 | **Full audit trail** | Every stage records a `LoopStep` with timestamp, summary and details, rendered to both the UI and the log file. | `LoopStep`, `explain_run()`, `log_agent_run()` |
 
@@ -362,7 +491,11 @@ An **Owner** aggregates **Pets**, a **Pet** aggregates **Tasks**, and the **Sche
 
 ## 🧠 Design Decisions and Trade-offs
 
-**Rules, not a language model.** The loop is driven by explicit constants and comparisons rather than an LLM. *Trade-off:* it cannot handle care instructions it has no rule for ("walk him less in the heat"), and `REQUIRED_CARE` has to be extended by hand for each species. *Why anyway:* for a system that moves medication times, a reproducible, inspectable decision is worth more than a flexible one. Every run gives the same answer, every answer can be traced to a line of code, and nothing needs an API key or network access.
+**Rules decide; the language model advises.** *(Revised when Gemini was added - this section previously read "Rules, not a language model".)* Every decision that affects an animal is still made by explicit constants and comparisons: what care a species needs, what counts as a conflict, how far apart feedings must be, whether a run is approved. Gemini is layered on top for two things only - narrating the audit trail, and *proposing* a slot that `_slot_acceptable()` then re-checks against those same rules. *Trade-off:* the system still cannot handle care instructions it has no rule for ("walk him less in the heat"); the model can describe that need but not act on it. *Why anyway:* for a system that moves medication times, a reproducible, inspectable decision is worth more than a flexible one. Every scheduling answer is still traceable to a line of code, still identical across runs, and still produced when the API is down, rate-limited, or absent.
+
+**The user's clock beats the agent's.** A time the owner types is pinned (`_is_user_fixed()`); the Executor will not move it to resolve a conflict or a feeding gap. *Trade-off:* two overlapping owner-set times cannot be auto-resolved, so the run ends `NEEDS REVIEW` with the clash reported. *Why anyway:* silently rewriting someone's day to make the agent's own checks pass is the wrong trade. Medication keeps its separate pin for the same reason, and an untimed task is still placed freely - no preference was expressed, so there is nothing to override.
+
+**A hard per-review call budget.** `LLM_MAX_CALLS_PER_RUN = 4`. *Trade-off:* on a multi-pet schedule some steps get rule-based placement with no model input. *Why anyway:* the Gemini free tier allows 20 requests **per day**. An uncapped loop would spend a whole day's quota in two reviews, so the cap buys predictable cost and graceful degradation instead of a mid-run failure.
 
 **Keyword matching on task titles.** A task counts as a feeding if `"feed"` appears in its title. *Trade-off:* this is genuinely fragile — "Breakfast" is a feeding that the agent will not recognise, and it will helpfully add a redundant "Feed Mia" alongside it. *Why anyway:* the alternative is a task-type enum, which would force users to categorise every task through a dropdown and would break every task created before the change. A `care_type` field is the right fix and the clearest next step for this codebase.
 
@@ -390,14 +523,15 @@ python -m pytest
 ============================= test session starts =============================
 platform win32 -- Python 3.14.3, pytest-9.2.0, pluggy-None
 rootdir: c:\Users\thevi\Applied-AI-System-Project
-collected 34 items
+plugins: None-None
+collected 35 items
 
 tests\test_pawpal.py ..................................                  [100%]
 
-============================= 34 passed in 0.14s ==============================
+============================= 35 passed in 0.11s ==============================
 ```
 
-### What the 34 tests cover
+### What the 35 tests cover
 
 | Area | Happy paths | Edge cases |
 |------|-------------|------------|
@@ -406,9 +540,39 @@ tests\test_pawpal.py ..................................                  [100%]
 | **Conflict detection** | Same-time tasks flagged; overlapping windows flagged within one pet and across pets, labelled accordingly | Back-to-back tasks don't conflict (half-open windows); untimed tasks ignored; invalid `preferred_time` warns instead of crashing; zero-duration tasks never conflict; past-midnight does not wrap (documented limitation); empty and single-task lists |
 | **Plan generation** | Tasks that fit are all planned; exact-fit budget leaves nothing skipped; `explain_plan` reports minutes, skip reasons and conflicts | Empty pets/owners yield an empty plan; zero available minutes skips everything; an oversized task is skipped but a later shorter one still fits; completed excluded, overdue included; re-running resets prior results |
 
+### Reliability and guardrail evaluation
+
+Structured results from `python demo.py` plus the fuzz harness described below. All
+rows are reproducible; none are screenshots.
+
+| # | Test input | Evaluation criteria | Result |
+|---|---|---|---|
+| 1 | Owner sets Lunch 13:30 + Walk 07:00 | Both times unchanged after review | **Pass** - 13:30 and 07:00 intact |
+| 2 | Dog + cat, one feeding each, 600 min | Missing care added, 2 feedings/pet, 6h+ apart | **Pass** - APPROVED in 2 iterations, 120/600 min |
+| 3 | Dog, 40 min of tasks, only 30 min available | Must not exceed budget; must escalate | **Pass** - committed 20/30, verdict NEEDS REVIEW |
+| 4 | Gemini suggests `19:30` for a 2nd feeding | Accept (6h00 gap, evening block) | **Pass** - accepted, placed 19:30 |
+| 5 | Gemini suggests `19:00` | Reject (5h30 < 6h minimum) | **Pass** - rejected, fell back to 07:30 |
+| 6 | Gemini suggests `02:00` | Reject (outside safe window/blocks) | **Pass** - rejected, fell back to 07:30 |
+| 7 | Gemini replies `banana` | Reject unparseable output | **Pass** - rejected, fell back to 07:30 |
+| 8 | No `GEMINI_API_KEY` set | Loop completes, rules unaffected | **Pass** - APPROVED, commentary omitted |
+| 9 | API returns `429 RESOURCE_EXHAUSTED` | Absorbed, schedule still produced | **Pass** - observed live; run completed |
+| 10 | API returns `504 DEADLINE_EXCEEDED` | Absorbed, schedule still produced | **Pass** - observed live; run completed |
+| 11 | 400 random configs x 8 repeat runs | No duplicate tasks; no budget overrun | **Pass** - 0/1200 duplicates, 0/1200 over budget |
+| 12 | Same config re-reviewed 8 times | Task count converges, no multiplication | **Pass** - 0/400 configs changed after run 1 |
+
+**Summary.** 35/35 unit tests pass in ~0.1s with no network access. The fuzz harness
+(400 randomised owner/pet/task configurations, each reviewed 8 times) found zero
+duplicate tasks, zero budget overruns, and full convergence after the first run.
+Every LLM failure mode encountered in real use - quota exhaustion, server timeout,
+missing key, unparseable output - degraded to rule-only behaviour without losing a
+schedule. The two bugs this testing actually caught were a duplication bug (the
+Planner judged "missing care" against the budget-trimmed plan instead of the pet's
+real task list, inventing a duplicate every run) and an unbounded time commitment
+(70 minutes scheduled against a 30-minute budget, reported as APPROVED).
+
 ### Coverage gap: the agentic loop is not yet unit-tested
 
-**All 34 tests cover the original `Scheduler`. There are currently no automated tests for `PetCareAgent`, `Issue`, `LoopStep` or `log_agent_run`.** The loop has been verified manually — the three examples above are captured from real runs, and the Streamlit integration was exercised end to end with `streamlit.testing.v1.AppTest` (button click → nine stage expanders → `APPROVED` verdict → log entry on disk) — but manual verification is not a regression suite.
+**35 tests cover the original `Scheduler` plus one agent-level regression test. There are currently no automated tests for `PetCareAgent`, `Issue`, `LoopStep` or `log_agent_run`.** The loop has been verified manually — the three examples above are captured from real runs, and the Streamlit integration was exercised end to end with `streamlit.testing.v1.AppTest` (button click → nine stage expanders → `APPROVED` verdict → log entry on disk) — but manual verification is not a regression suite.
 
 The highest-value tests to add next, roughly in order:
 
@@ -423,10 +587,33 @@ The scheduling core earns four stars on its own: every documented behaviour has 
 
 ---
 
+## 🪞 Reflection (brief)
+
+> The graded responsible-AI reflection lives in **[`model_card.md`](model_card.md)** —
+> limitations and biases, misuse and guardrails, reliability surprises, and the AI
+> collaboration notes. This is only a short note, as the rubric specifies.
+
+Building this taught me that the hard part of an applied AI system is deciding what the
+AI is *allowed* to decide. The scheduler was easy; drawing the line between "the agent
+may fill a gap you left" and "the agent may not move a time you chose" took longer than
+writing the loop. Adding Gemini made the same question concrete a second time — the
+model is genuinely useful for explaining a schedule to an owner, and genuinely unsafe as
+the thing that picks a feeding time, so it does the first and only proposes the second.
+
+The other lesson was that external services fail in ways documentation does not predict.
+A `404` on a documented model, a `504` that hung for 48 seconds, and a `429` revealing a
+20-request daily cap each produced a code change. None of them can break a schedule,
+because the rules never depended on the model — which is the whole argument for building
+it that way.
+
+---
+
 ## 📄 Related documents
 
 - [`diagrams/architecture.mmd`](diagrams/architecture.mmd) — system architecture diagram
 - [`diagrams/uml_final.mmd`](diagrams/uml_final.mmd) / [`.png`](diagrams/uml_final.png) — class diagram
 - [`ai_interactions.md`](ai_interactions.md) — hand-written AI collaboration notes, plus the auto-generated agent run log
 - [`reflection.md`](reflection.md) — design reflection
-- [`model_card.md`](model_card.md) — limitations, biases, misuse risks and guardrails, reliability findings, and AI collaboration notes
+- [`model_card.md`](model_card.md) — limitations, biases, misuse risks and guardrails, reliability findings, and AI collaboration notes (**the graded reflection**)
+- [`demo.py`](demo.py) / [`demo_output.txt`](demo_output.txt) — the four evidence scenarios and their captured output
+- [`.env.example`](.env.example) — template for the optional `GEMINI_API_KEY`

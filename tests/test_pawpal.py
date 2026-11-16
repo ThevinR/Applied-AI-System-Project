@@ -394,3 +394,13 @@ def test_explain_plan_reports_planned_skipped_and_conflicts():
     assert "Rex: Walk (30 min, high) at 08:00" in text
     assert "Skipped Rex: Grooming" in text and "not enough time left" in text
     assert "Warning (same pet)" in text
+
+
+def test_care_synonyms_count_as_required_steps():
+    from pawpal_system import _matches
+
+    assert _matches(Task("Dinner for Mochi", 20, Priority.HIGH), "feed")
+    assert _matches(Task("Refill the drinking bowl", 5, Priority.HIGH), "water")
+    assert _matches(Task("Evening stroll", 20, Priority.HIGH), "walk")
+    assert _matches(Task("Vet checkup", 30, Priority.MEDIUM), "vet")
+    assert not _matches(Task("Play session", 20, Priority.MEDIUM), "feed")

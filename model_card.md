@@ -2,7 +2,7 @@
 
 **System:** PawPal+ agentic pet-care scheduler
 **Version:** Capstone build (CodePath AI110)
-**Type:** Deterministic, rule-based agentic loop — **no machine-learned model and no LLM is involved at runtime**
+**Type:** Deterministic, rule-based agentic loop, **augmented by an advisory LLM** (Google Gemini via `google-genai`). Every scheduling decision is made by hand-written rules; the LLM only narrates the audit trail and proposes slots that the rules then validate or reject. The system runs fully without an API key.
 **Owner:** Thevin R.
 
 ## What this system is
@@ -45,7 +45,7 @@ These are the assumptions I baked into the rules. Each one is a judgement about 
 
 **The "safe window" assumes a daytime human.** `SAFE_WINDOW` is 06:00–22:00. A night-shift nurse who feeds their cat at 23:30 before bed will have that flagged as unsafe and moved. The rule encodes a 9-to-5 household as correct, and penalises shift workers, people in very different time zones from the rule's author, and anyone whose animal is nocturnal by nature.
 
-**Nutrition rules encode adult dog/cat norms.** "At least two feedings, at least four hours apart" is reasonable for a healthy adult dog or cat. It is wrong for a puppy or kitten (needs three or four), wrong for a rabbit (grazes continuously), wrong for many reptiles (may eat weekly), and wrong for a diabetic animal on a vet-specified schedule. The agent will actively *add feedings* to a schedule that a vet deliberately restricted.
+**Nutrition rules encode adult dog/cat norms.** "At least two feedings, at least six hours apart" is reasonable for a healthy adult dog or cat. It is wrong for a puppy or kitten (needs three or four), wrong for a rabbit (grazes continuously), wrong for many reptiles (may eat weekly), and wrong for a diabetic animal on a vet-specified schedule. The agent will actively *add feedings* to a schedule that a vet deliberately restricted.
 
 **Pinning is only as good as the vocabulary.** `PINNED_KEYWORDS` covers `medicat`, `medicine`, `insulin`, `dose`. A task titled **"Apoquel"**, **"eye drops"** or **"inhaler"** is not recognised as time-critical and can be moved. The protection is strongest for users who happen to name tasks the way I did.
 
@@ -54,6 +54,40 @@ These are the assumptions I baked into the rules. Each one is a judgement about 
 **Rules written by a non-expert.** I am not a veterinarian. These thresholds came from general knowledge, not clinical guidance. They are plausible defaults, not standards of care, and the system presents them with more confidence than their provenance deserves.
 
 ---
+
+### 1.4 The LLM layer, and what it is deliberately not allowed to do
+
+PawPal+ now calls Google Gemini (`google-genai`, `client.models.generate_content()`)
+in two places. Both are **advisory**, and that boundary is the most important
+design decision in the system:
+
+| Where | What the model does | What it cannot do |
+| --- | --- | --- |
+| Planner / Reflector | Narrates findings and the verdict in plain English | Change a finding, or claim a plan is safe when issues are listed |
+| Executor | Proposes a time for a missing second feeding | Place that time itself — every suggestion passes `_slot_acceptable()` first |
+
+`_slot_acceptable()` re-checks a proposed time against exactly the rules a
+rule-chosen slot must satisfy: inside a named day block, inside the safe
+window, no clash with existing tasks, and at least `MIN_FEEDING_GAP_MINUTES`
+from every other feeding. A suggestion that fails is logged as rejected and
+the deterministic slot is used instead. **A hallucinated time cannot reach a
+schedule.** The audit trail records whether each suggestion was accepted or
+rejected, so the model's influence is always visible.
+
+The system degrades to fully deterministic behaviour when the key is missing,
+the SDK is absent, or a call fails. This is not hypothetical: during testing
+the API returned `504 DEADLINE_EXCEEDED` and, after repeated calls,
+`429 RESOURCE_EXHAUSTED`. In every case the loop completed normally without
+commentary. The 34-test suite never touches the network, because
+`PetCareAgent` defaults to `commentator=None`.
+
+**User-first rule.** A time the owner typed is treated as a commitment:
+`_is_user_fixed()` pins any task with `source == "owner"` and an explicit
+`preferred_time`, so the Executor will not move it to resolve a conflict or a
+feeding gap. If two owner-set times overlap, the agent reports the clash and
+leaves the decision to the person rather than silently rewriting their day.
+Only the owner's name is withheld from API calls; pet names, species, task
+titles and times are sent.
 
 ## 2. Potential misuses and preventive guardrails
 
@@ -78,7 +112,7 @@ These are the assumptions I baked into the rules. Each one is a judgement about 
 | **Independent verification stage** | `PetCareAgent.evaluate()` | The Evaluator judges the Executor's output against goals the Executor wasn't optimising for, so a "fix" that breaks nutrition is caught rather than trusted. |
 | **Guaranteed termination** | `PetCareAgent.reflect()` | Stops on approval, budget exhaustion, or a no-progress iteration. It cannot spin indefinitely or keep mutating a schedule. |
 | **Full audit trail** | `LoopStep`, `log_agent_run()` | Every change is attributable: which stage made it, in which iteration, at what time, and why. |
-| **Determinism** | No LLM anywhere | The same input always yields the same decisions, so a reviewer can reproduce any logged run exactly. |
+| **Determinism** | No LLM in the decision path | Scheduling decisions come only from rules, so the same input yields the same schedule and a reviewer can reproduce any logged run exactly. LLM output is confined to commentary and to suggestions that `_slot_acceptable()` must approve. |
 | **Explicit mutation warning** | Sidebar in `app.py` | The user is told before clicking that the review edits their schedule and that medication is exempt. |
 
 ### 2.3 Guardrails this system needs and does not have
@@ -102,15 +136,34 @@ What surprised me is that this failure *looked like success* in the logs. There 
 
 **The agent satisfied my rule while violating my intent.** Once the feedback path worked, the agent fixed the nutrition gap by adding a second feeding — at **06:30**, and named it "Evening feed Rex". It had searched for a free slot from the start of the day forward, found 06:30 open, and confirmed the four-hour gap to the midday feeding. Every rule I had written was satisfied. The result was nonsense: a dog fed at 06:30 and 12:00 with nothing for the following ten hours.
 
-This is specification gaming in a system with no learning in it at all, which I found genuinely clarifying. I had assumed that writing the rules by hand meant the system would do what I meant. It did exactly what I *wrote* — "at least four hours apart" — and the gap between that and "spread across the day" was invisible to me until I read the output. I fixed it by searching backwards from the end of the day for supplementary feedings, but the general lesson stands: specifying behaviour precisely is hard independent of the technology, and I only caught it because I read the schedule rather than the verdict.
+This is specification gaming in a system with no learning in it at all, which I found genuinely clarifying. I had assumed that writing the rules by hand meant the system would do what I meant. It did exactly what I *wrote* — "at least four hours apart" — and the gap between that and "spread across the day" was invisible to me until I read the output. I first fixed it by searching backwards from the end of the day, and later replaced that with named day blocks (morning/afternoon/evening) plus a six-hour minimum, but the general lesson stands: specifying behaviour precisely is hard independent of the technology, and I only caught it because I read the schedule rather than the verdict.
 
 **Refusing to act was the output I trusted most.** The run I'm most confident in is the one where the agent *failed*: two pinned medications five minutes apart, which it could not resolve. It fixed four other problems, left the clash alone, said "left 'Insulin dose' / 'Thyroid medication' overlapping: both are time-critical", and returned `NEEDS REVIEW`. Watching it decline to reshuffle medication did more for my confidence in the whole system than any of the approvals, because it was the first evidence that the constraints held under pressure rather than just in the happy path.
 
 **The environment was less reliable than the code.** While verifying the Streamlit integration, the app crashed with `source code string cannot contain null bytes`. The cause was nothing to do with PawPal+: `pandas/__init__.py` in the virtual environment was 8318 bytes of pure null bytes, apparently from disk corruption. Any `st.table()` call failed, and the pre-existing app had only avoided it by having no tasks to render in that particular test. It was a reminder that "my tests pass" and "this works on this machine" are different claims, and that a green suite tells you nothing about the layer underneath it. Reinstalling pandas fixed it.
 
-**Manual verification kept passing for the component with no tests.** All 34 tests cover the original `Scheduler`. The agentic loop — the newest and most consequential part — has none. Every scenario I tried by hand worked, which is precisely why the gap persisted: the loop kept *looking* reliable. The two real bugs above were both found by reading output, not by a failing test, and neither would be caught today if someone reintroduced them. That's documented in the README's testing section and it's the first thing I'd address next.
+**Manual verification kept passing for the component with almost no tests.** 34 of the 35 tests cover the original `Scheduler`. The agentic loop — the newest and most consequential part — has one regression test and otherwise relies on the `demo.py` scenarios and a randomised fuzz harness. Every scenario I tried by hand worked, which is precisely why the gap persisted: the loop kept *looking* reliable. The two real bugs above were both found by reading output, not by a failing test, and neither would be caught today if someone reintroduced them. That's documented in the README's testing section and it's the first thing I'd address next.
 
 ---
+
+### 3.1 What the Gemini integration surprised me with
+
+Adding a real external API produced failures I could not have predicted from the docs,
+and each one changed the code:
+
+| What happened | What it forced |
+| --- | --- |
+| `404` — `gemini-2.5-flash` is "no longer available to new users" | Probing the key's 28 visible models instead of trusting a documented default |
+| The model the error *recommended* (`gemini-3.8-flash`) hung and returned `504` after 48s | A hard `LLM_TIMEOUT_MS = 20000` client timeout, so the UI can never hang |
+| `429` revealed the free tier allows only **20 requests per day** | `LLM_MAX_CALLS_PER_RUN = 4`, capping one review's cost so a day's quota survives ~5 reviews |
+| Quota exhausted mid-testing | Proving the fallback path for real: every run still produced a schedule |
+
+The most useful surprise was the smallest. I tested the validation gate with a stub
+returning `19:00` for a second feeding, expecting it to pass — it looks perfectly
+sensible. It was rejected: 13:30 → 19:00 is 5h30, under the six-hour minimum. A time
+that survives human plausibility checking can still break a nutritional rule, which is
+the clearest argument I have for keeping the gate rather than trusting good-looking
+model output.
 
 ## 4. AI collaboration notes
 
@@ -162,7 +215,7 @@ The assistant was faster than me at everything except deciding what the system s
 |---|---|
 | **Intended use** | Personal daily pet-care planning for common household pets, with a human reviewing the result. |
 | **Out of scope** | Veterinary guidance, medication timing decisions, institutional or multi-user care, proof of care performed, any species without explicit rules. |
-| **Decision basis** | Hand-written deterministic rules. No model, no training data, no LLM at runtime. |
+| **Decision basis** | Hand-written deterministic rules. No trained model and no learned parameters. An LLM (Gemini) contributes commentary and rule-validated suggestions only, and is optional. |
 | **Known to fail for** | Non-dog/cat/rabbit species, night-shift owners, puppies/kittens/grazing animals, vet-restricted feeding schedules, tasks not named with recognised keywords, non-English users. |
 | **Strongest safeguard** | Escalates rather than forcing a resolution it cannot justify, and never moves pinned medication. |
 | **Weakest point** | An "APPROVED" verdict reads as broader assurance than the four rules behind it actually provide. |

@@ -82,7 +82,23 @@ flowchart TD
     WRITER -->|"append on every run"| MDFILE
     WRITER -.->|"OSError surfaced as st.error"| TRAIL
 
+    %% --- AI-augmented layer (advisory only) -------------------------
+    GEMINI["Gemini via google-genai<br>client.models.generate_content()"]
+    GATE{"_slot_acceptable()<br>block? clash? 6h gap? safe window?"}
+
+    PLANNER -.->|"findings to narrate"| GEMINI
+    REFLECTOR -.->|"verdict to narrate"| GEMINI
+    GEMINI -.->|"commentary (never changes decisions)"| TRAIL
+    EXECUTOR -.->|"where should this feeding go?"| GEMINI
+    GEMINI -.->|"proposed HH:MM"| GATE
+    GATE -.->|"accepted"| EXECUTOR
+    GATE -.->|"rejected -> rule-based slot"| EXECUTOR
+
     %% ---------------------------------------------------------------
+    classDef llm fill:#FCE4EC,stroke:#AD1457,color:#0D1B2A
+    class GEMINI llm
+    class GATE decision
+
     classDef ui fill:#E3F2FD,stroke:#1565C0,color:#0D1B2A
     classDef core fill:#E8F5E9,stroke:#2E7D32,color:#0D1B2A
     classDef agent fill:#FFF3E0,stroke:#EF6C00,color:#0D1B2A

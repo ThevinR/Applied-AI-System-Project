@@ -1,2 +1,7 @@
 streamlit>=1.30
 pytest>=7.0
+
+# Optional: live LLM audit commentary (Google Gemini).
+# The scheduling and safety rules run fine without these.
+google-genai>=1.0
+python-dotenv>=1.0

@@ -1,9 +1,20 @@
+import os
+import re
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
+
+# Load .env (GEMINI_API_KEY, GEMINI_MODEL) if python-dotenv is installed.
+# Optional: the scheduling core works without it, and without any API key.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:  # pragma: no cover - only hit in a bare environment
+    pass
 
 
 class Priority(Enum):
@@ -28,6 +39,10 @@ class Task:
     frequency: Frequency = Frequency.DAILY
     is_completed: bool = False
     due_date: date = field(default_factory=date.today)
+    #: Who created this task. "owner" means a person typed it in, so its
+    #: preferred_time is a commitment the agent must not quietly rewrite.
+    #: "agent" marks a task the loop added to fill a gap, which it may move.
+    source: str = "owner"
     id: str = field(default_factory=lambda: uuid4().hex)
 
     def mark_complete(self) -> Optional["Task"]:
@@ -269,6 +284,20 @@ REQUIRED_CARE: Dict[str, Tuple[str, ...]] = {
 #: Used for any species not listed above.
 DEFAULT_REQUIRED_CARE: Tuple[str, ...] = ("feed", "water")
 
+#: Words that count as each care step. A task satisfies a step when its title
+#: contains any of these substrings, so "Dinner for Mochi" covers "feed" and
+#: "Bath time" covers "clean". Keep entries specific: a short word such as
+#: "eat" or "run" would also match inside other words ("treat", "morning").
+CARE_WORDS: Dict[str, Tuple[str, ...]] = {
+    "feed": ("feed", "food", "meal", "breakfast", "lunch", "dinner", "supper",
+             "kibble", "snack", "bowl"),
+    "water": ("water", "drink", "hydrat", "fountain"),
+    "walk": ("walk", "stroll", "jog", "hike", "exercise", "park"),
+    "litter": ("litter", "poop", "scoop"),
+    "clean": ("clean", "cage", "bedding", "hutch", "bath"),
+    "vet": ("vet", "veterin", "checkup", "check-up", "clinic", "vaccin"),
+}
+
 #: Minimum gap between two feedings for the same pet, so a day's food is not
 #: served all at once (a bloat / overfeeding risk). Six hours is the usual
 #: floor for a twice-a-day feeding routine.
@@ -313,14 +342,50 @@ _FALLBACK_SLOTS = tuple(time(h, m) for h in range(6, 22) for m in (0, 30))
 
 
 def _matches(task: Task, keyword: str) -> bool:
-    """True when a task's title covers the given care keyword."""
-    return keyword in task.title.lower()
+    """True when a task's title covers the given care keyword or any synonym."""
+    title = task.title.lower()
+    words = CARE_WORDS.get(keyword, (keyword,))
+    return any(word in title for word in words)
+
+
+def _is_medication(task: Task) -> bool:
+    """Medication-like tasks are time-critical and must keep their exact time."""
+    title = task.title.lower()
+    return any(k in title for k in PINNED_KEYWORDS)
+
+
+def _is_user_fixed(task: Task) -> bool:
+    """True when a person chose this task's time themselves.
+
+    User-first rule: a time the owner typed in is a commitment, not a
+    suggestion. The agent may add care around it, but never silently shifts
+    it. A task the owner left untimed is not fixed — they expressed no
+    preference, so the agent is free to place it.
+    """
+    return task.source == "owner" and isinstance(task.preferred_time, time)
 
 
 def _is_pinned(task: Task) -> bool:
-    """Medication-like tasks must keep their exact time."""
-    title = task.title.lower()
-    return any(k in title for k in PINNED_KEYWORDS)
+    """True when the Executor must not move this task.
+
+    Covers both medication (clinically time-critical) and any time the owner
+    entered by hand (their decision to make, not the agent's).
+    """
+    return _is_medication(task) or _is_user_fixed(task)
+
+
+def is_user_fixed(task: Task) -> bool:
+    """Public alias of _is_user_fixed, for the UI to badge owner-set times."""
+    return _is_user_fixed(task)
+
+
+def _pin_reason(task: Task) -> str:
+    """Why a task cannot be moved, for the audit trail."""
+    if _is_medication(task):
+        return "time-critical medication"
+    if _is_user_fixed(task):
+        return "a time you set yourself"
+    return "not pinned"
 
 
 def _from_minutes(total: int) -> time:
@@ -353,10 +418,252 @@ class LoopStep:
     summary: str
     details: List[str] = field(default_factory=list)
     timestamp: datetime = field(default_factory=datetime.now)
+    #: Optional LLM narration of this step. Commentary only — it never
+    #: changes what the deterministic rules decided.
+    commentary: str = ""
 
     def render(self) -> str:
         head = f"Iter {self.iteration} | {self.stage:<9} | {self.summary}"
-        return "\n".join([head] + [f"    - {d}" for d in self.details])
+        lines = [head] + [f"    - {d}" for d in self.details]
+        if self.commentary:
+            lines.append(f"    > {self.commentary}")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Optional LLM commentary (Google Gemini via the official google-genai SDK)
+# ---------------------------------------------------------------------------
+
+#: Model used for audit commentary. Overridable with GEMINI_MODEL in .env.
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+#: Hard ceiling on a single call, so a slow or overloaded model can never hang
+#: the Streamlit UI. Some Gemini models deadline on the server side; when that
+#: happens the loop simply runs without commentary.
+LLM_TIMEOUT_MS = 20_000
+LLM_MAX_OUTPUT_TOKENS = 2_000
+#: Calls allowed per agentic review. The Gemini free tier permits only 20
+#: generate_content requests PER DAY, so an unbounded loop would exhaust a
+#: day's quota in two or three reviews. Capping per run keeps the cost of a
+#: single review predictable and leaves the rules to fill in the rest.
+LLM_MAX_CALLS_PER_RUN = 4
+
+_LLM_SYSTEM_INSTRUCTION = (
+    "You are the narrator for PawPal+, a deterministic pet-care scheduling "
+    "agent. You are given findings that rule-based code has ALREADY decided. "
+    "Explain them to a pet owner in plain, warm, practical English. "
+    "Never contradict the findings, never invent tasks, times, pets or "
+    "problems, and never claim a schedule is safe when issues are listed. "
+    "Be concise: at most 3 short sentences, no headings, no bullet points, "
+    "no markdown."
+)
+
+
+def _parse_hhmm(text: str) -> Optional[time]:
+    """Pull an HH:MM time out of a model reply, or return None.
+
+    Deliberately forgiving about surrounding text but strict about the value:
+    anything that is not a real 24-hour time is rejected rather than guessed at.
+    """
+    if not text:
+        return None
+    match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
+    if match is None:
+        return None
+    return time(int(match.group(1)), int(match.group(2)))
+
+
+@dataclass
+class LLMStatus:
+    """Whether LLM commentary is active, and why not when it is not."""
+
+    available: bool
+    model: str = ""
+    detail: str = ""
+
+
+class LLMCommentator:
+    """Turns the loop's structured findings into human-readable commentary.
+
+    Deliberately advisory only. The deterministic rules in this module remain
+    the single source of truth: this class never decides whether a pet is fed,
+    whether a time is safe, or whether a run is approved — it only narrates
+    decisions already made. If the key is missing, the SDK is absent, or a call
+    fails or times out, every method returns "" and the agent behaves exactly
+    as it does offline. That keeps the safety-critical path testable and
+    independent of a network service.
+
+    The owner's name is never sent to the API; only pet names, species, task
+    titles, times and rule findings are.
+    """
+
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None,
+                 enabled: bool = True):
+        self._client = None
+        self._types = None
+        self.model = model or os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+        self.status = LLMStatus(available=False, model=self.model)
+        #: Set when a call fails, so the UI can show why commentary is absent.
+        self.last_error: str = ""
+        #: Calls spent in the current review, reset by PetCareAgent.run().
+        self.calls_made: int = 0
+        self.max_calls_per_run: int = LLM_MAX_CALLS_PER_RUN
+
+        if not enabled:
+            self.status.detail = "disabled by caller"
+            return
+
+        key = api_key or os.getenv("GEMINI_API_KEY")
+        if not key:
+            self.status.detail = (
+                "no GEMINI_API_KEY found — copy .env.example to .env and add one"
+            )
+            return
+
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError:
+            self.status.detail = "google-genai is not installed (pip install google-genai)"
+            return
+
+        try:
+            self._types = types
+            self._client = genai.Client(
+                api_key=key,
+                http_options=types.HttpOptions(timeout=LLM_TIMEOUT_MS),
+            )
+            self.status = LLMStatus(available=True, model=self.model,
+                                    detail="ready")
+        except Exception as exc:  # noqa: BLE001 - never break the loop
+            self.status.detail = f"client init failed: {type(exc).__name__}"
+
+    # -- internals -------------------------------------------------------
+
+    def _generate(self, prompt: str) -> str:
+        """One guarded call. Returns "" on any failure, never raises."""
+        if self._client is None:
+            return ""
+        if self.calls_made >= self.max_calls_per_run:
+            self.last_error = (
+                f"per-review call budget ({self.max_calls_per_run}) reached - "
+                "remaining steps used the rules only"
+            )
+            return ""
+        self.calls_made += 1
+        try:
+            response = self._client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=self._types.GenerateContentConfig(
+                    system_instruction=_LLM_SYSTEM_INSTRUCTION,
+                    max_output_tokens=LLM_MAX_OUTPUT_TOKENS,
+                    temperature=0.3,
+                ),
+            )
+            text = (response.text or "").strip()
+            if text:
+                self.last_error = ""
+            return text
+        except Exception as exc:  # noqa: BLE001 - commentary is best-effort
+            text = str(exc)
+            if "RESOURCE_EXHAUSTED" in text or "429" in text:
+                self.last_error = "Gemini quota exceeded (429) - commentary skipped"
+            elif "DEADLINE_EXCEEDED" in text or "504" in text:
+                self.last_error = "Gemini timed out (504) - commentary skipped"
+            else:
+                self.last_error = f"{type(exc).__name__}: {text[:140]}"
+            return ""
+
+    def reset_run_budget(self) -> None:
+        """Start a fresh per-review call allowance."""
+        self.calls_made = 0
+
+    @staticmethod
+    def _describe(schedule: List[Task]) -> str:
+        if not schedule:
+            return "(the plan is empty)"
+        return "\n".join(
+            f"- {t.preferred_time:%H:%M} {t.pet_name}: {t.title} "
+            f"({t.duration_minutes} min, {t.priority.name.lower()})"
+            if isinstance(t.preferred_time, time) else
+            f"- (no time) {t.pet_name}: {t.title} ({t.duration_minutes} min)"
+            for t in schedule
+        )
+
+    # -- the two narrated stages ----------------------------------------
+
+    def suggest_care_time(self, pet_name: str, species: str, care: str,
+                          existing: List[Task], blocks: Dict[str, Tuple[time, time]],
+                          duration_minutes: int, min_gap_minutes: int) -> Optional[time]:
+        """Ask the model where a missing care task should go.
+
+        The model only *proposes* a time. The caller re-checks it against the
+        same deterministic rules every other slot must pass (inside a day
+        block, no clash, far enough from existing feedings), and discards the
+        suggestion if it fails. A hallucinated time can therefore never reach
+        a schedule — the worst case is falling back to the rule-based slot.
+
+        Returns a parsed time, or None if unavailable or unparseable.
+        """
+        if self._client is None:
+            return None
+        current = "\n".join(
+            f"- {t.preferred_time:%H:%M} {t.title} ({t.duration_minutes} min)"
+            for t in existing if isinstance(t.preferred_time, time)
+        ) or "- (none scheduled yet)"
+        block_text = ", ".join(
+            f"{name} {start:%H:%M}-{end:%H:%M}" for name, (start, end) in blocks.items()
+        )
+        reply = self._generate(
+            f"Choose a time of day for a '{care}' task for {pet_name}, a "
+            f"{species}. It lasts {duration_minutes} minutes.\n\n"
+            f"That pet's existing scheduled care:\n{current}\n\n"
+            f"Allowed blocks: {block_text}.\n"
+            f"Rule: it must be at least {min_gap_minutes} minutes "
+            f"({min_gap_minutes // 60} hours) away from every existing feeding, "
+            "and must sit inside one of the allowed blocks. A supplementary "
+            "feeding belongs in the afternoon or evening, not next to the "
+            "morning meal.\n\n"
+            "Answer with the start time ONLY, as 24-hour HH:MM. No other text."
+        )
+        return _parse_hhmm(reply)
+
+    def planner_commentary(self, pets: List[Pet], schedule: List[Task],
+                           issues: List[Issue]) -> str:
+        """Explain what the Planner diagnosed, in an owner's terms."""
+        if self._client is None:
+            return ""
+        roster = ", ".join(f"{p.name} ({p.species})" for p in pets) or "no pets"
+        findings = "\n".join(f"- {i}" for i in issues) or "- none"
+        return self._generate(
+            "A rule-based planner has just inspected today's pet-care plan.\n\n"
+            f"Pets: {roster}\n\n"
+            f"Current plan:\n{self._describe(schedule)}\n\n"
+            f"Issues the rules found:\n{findings}\n\n"
+            "In at most 3 sentences, tell the owner what these findings mean "
+            "and why they matter for the animals' wellbeing. If there are no "
+            "issues, say briefly that the plan looks complete."
+        )
+
+    def reflector_commentary(self, verdict: str, iteration: int,
+                             issues: List[Issue], schedule: List[Task],
+                             available_minutes: int) -> str:
+        """Explain the Reflector's verdict and what the owner should do next."""
+        if self._client is None:
+            return ""
+        findings = "\n".join(f"- {i}" for i in issues) or "- none"
+        committed = sum(t.duration_minutes for t in schedule)
+        return self._generate(
+            f"A rule-based reviewer has reached the verdict: {verdict} "
+            f"(after iteration {iteration}).\n\n"
+            f"Final plan ({committed} of {available_minutes} available minutes):\n"
+            f"{self._describe(schedule)}\n\n"
+            f"Outstanding issues:\n{findings}\n\n"
+            "In at most 3 sentences, explain the verdict to the owner. If "
+            "issues remain, say plainly what they should decide or change "
+            "(for example allowing more time, or dropping a task). Do not "
+            "promise the schedule is fine if issues are listed."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -373,15 +680,22 @@ class PetCareAgent:
     """
 
     def __init__(self, owner: Owner, scheduler: Optional[Scheduler] = None,
-                 max_iterations: int = 3):
+                 max_iterations: int = 3,
+                 commentator: Optional["LLMCommentator"] = None):
         self.owner = owner
         self.scheduler = scheduler or Scheduler(owner)
         self.max_iterations = max_iterations
+        #: Optional Gemini narrator. Defaults to None so the loop — and the
+        #: test suite — never touches the network unless a caller opts in.
+        self.commentator = commentator
         self.log: List[LoopStep] = []
         self.schedule: List[Task] = []
         #: Care the Executor could not fit in the owner's available time, set
         #: each pass and read by the Evaluator.
         self._deferred: List[Issue] = []
+        #: Audit notes about Gemini's slot suggestions (accepted or rejected),
+        #: rebuilt each Executor pass.
+        self._llm_placements: List[str] = []
         self.approved = False
         self.iterations_used = 0
         self.started_at: Optional[datetime] = None
@@ -390,8 +704,12 @@ class PetCareAgent:
     # -- helpers ---------------------------------------------------------
 
     def _record(self, iteration: int, stage: str, summary: str,
-                details: Optional[List[str]] = None) -> None:
-        self.log.append(LoopStep(iteration, stage, summary, list(details or [])))
+                details: Optional[List[str]] = None,
+                commentary: str = "") -> None:
+        self.log.append(
+            LoopStep(iteration, stage, summary, list(details or []),
+                     commentary=commentary)
+        )
 
     def _pet(self, name: str) -> Optional[Pet]:
         return next((p for p in self.owner.pets if p.name == name), None)
@@ -556,9 +874,81 @@ class PetCareAgent:
             for f in others
             if f is not task and isinstance(f.preferred_time, time)
         ]
+        # AI-augmented: let Gemini propose the slot, but only accept it if it
+        # passes exactly the same checks a rule-chosen slot must pass.
+        suggested = self._llm_slot(task, schedule, others, anchors)
+        if suggested is not None:
+            return suggested
         return self._natural_slot(
             task, schedule, anchors=anchors, min_gap=MIN_FEEDING_GAP_MINUTES
         )
+
+    def _slot_acceptable(self, task: Task, slot: time, schedule: List[Task],
+                         anchors: List[time], min_gap: int) -> bool:
+        """Validate any proposed time against the deterministic rules.
+
+        A slot must sit inside one of the recognised day blocks, fit in the
+        safe window, clash with nothing already scheduled, and keep `min_gap`
+        from every anchor. This is the gate every LLM suggestion passes
+        through, so the model can advise but never override the rules.
+        """
+        start = _minutes(slot)
+        end = start + task.duration_minutes
+        if start < _minutes(SAFE_WINDOW[0]) or end > _minutes(SAFE_WINDOW[1]):
+            return False
+        in_block = any(
+            _minutes(b_start) <= start < _minutes(b_end)
+            for b_start, b_end in DAY_BLOCKS.values()
+        )
+        if not in_block:
+            return False
+        for b_start, b_end in self._occupied(schedule, exclude=task):
+            if start < b_end and b_start < end:
+                return False
+        for anchor in anchors:
+            if abs(start - _minutes(anchor)) < min_gap:
+                return False
+        return True
+
+    def _llm_slot(self, task: Task, schedule: List[Task], others: List[Task],
+                  anchors: List[time]) -> Optional[time]:
+        """Gemini's proposed slot for a feeding, or None if it is not usable.
+
+        Records the outcome either way, so the audit trail shows whether the
+        model's suggestion was taken or rejected — that traceability is the
+        point of letting it advise at all.
+        """
+        if self.commentator is None:
+            return None
+        pet = self._pet(task.pet_name)
+        if pet is None:
+            return None
+        suggestion = self.commentator.suggest_care_time(
+            pet_name=pet.name,
+            species=pet.species,
+            care="second feeding",
+            existing=[t for t in schedule if t.pet_name == pet.name],
+            blocks=DAY_BLOCKS,
+            duration_minutes=task.duration_minutes,
+            min_gap_minutes=MIN_FEEDING_GAP_MINUTES,
+        )
+        if suggestion is None:
+            self._llm_placements.append(
+                f"Gemini gave no usable time for '{task.title}'; used the rule-based slot"
+            )
+            return None
+        if not self._slot_acceptable(task, suggestion, schedule, anchors,
+                                     MIN_FEEDING_GAP_MINUTES):
+            self._llm_placements.append(
+                f"rejected Gemini's {suggestion:%H:%M} for '{task.title}' "
+                "(fails spacing, block or clash rules); used the rule-based slot"
+            )
+            return None
+        self._llm_placements.append(
+            f"accepted Gemini's {suggestion:%H:%M} for '{task.title}' "
+            "(passed spacing, block and clash checks)"
+        )
+        return suggestion
 
     @staticmethod
     def _committed_minutes(schedule: List[Task]) -> int:
@@ -693,10 +1083,20 @@ class PetCareAgent:
             ))
 
         issues.sort(key=lambda i: -i.severity.value)
+        # The rules above have already decided everything; the model only
+        # explains them, and an empty string just means no commentary.
+        # Only the first pass is narrated. Later passes describe a schedule
+        # that is about to change anyway, and each call costs a round trip
+        # against a rate-limited quota.
+        commentary = (
+            self.commentator.planner_commentary(self.owner.pets, schedule, issues)
+            if self.commentator is not None and iteration == 1 else ""
+        )
         self._record(
             iteration, "PLANNER",
             f"analyzed {len(schedule)} task(s); found {len(issues)} issue(s)",
             [str(i) for i in issues] or ["schedule looks complete and conflict-free"],
+            commentary=commentary,
         )
         return issues
 
@@ -718,6 +1118,7 @@ class PetCareAgent:
         # Rebuilt every pass, so a deferral that later becomes affordable is
         # not carried around as a stale complaint.
         self._deferred = []
+        self._llm_placements = []
 
         # 2a-i. Pull care the pet already owns back into the plan, rather than
         # creating a duplicate of it.
@@ -774,6 +1175,7 @@ class PetCareAgent:
                 duration_minutes=15,
                 priority=Priority.HIGH,
                 frequency=Frequency.DAILY,
+                source="agent",
             )
             if not self._fits_budget(new_task, working):
                 actions.append(self._defer(
@@ -832,6 +1234,7 @@ class PetCareAgent:
                     duration_minutes=15,
                     priority=Priority.HIGH,
                     frequency=Frequency.DAILY,
+                    source="agent",
                 )
                 if not self._fits_budget(new_task, working):
                     actions.append(self._defer(
@@ -888,7 +1291,9 @@ class PetCareAgent:
             mover = b if not _is_pinned(b) else a
             if _is_pinned(mover):
                 actions.append(
-                    f"left '{a.title}' / '{b.title}' overlapping: both are time-critical"
+                    f"left '{a.title}' ({_pin_reason(a)}) and '{b.title}' "
+                    f"({_pin_reason(b)}) overlapping: neither may be moved — "
+                    "this one is yours to resolve"
                 )
                 continue
             old = mover.preferred_time
@@ -918,6 +1323,7 @@ class PetCareAgent:
 
         # 2e. Reorder the schedule chronologically so it reads as a day plan.
         working = self.scheduler.sort_by_time(working)
+        actions.extend(self._llm_placements)
         self._record(
             iteration, "EXECUTOR",
             f"applied {len(actions)} adjustment(s)",
@@ -1033,10 +1439,20 @@ class PetCareAgent:
         (the same number of issues as last time), since more passes would only
         repeat themselves.
         """
+        def narrate(verdict: str) -> str:
+            """Ask the model to explain a verdict the rules have already set."""
+            if self.commentator is None:
+                return ""
+            return self.commentator.reflector_commentary(
+                verdict, iteration, issues, self.schedule or [],
+                self.owner.available_minutes,
+            )
+
         if not issues:
             self._record(iteration, "REFLECTOR",
                          "APPROVED - schedule is safe, complete and well spaced",
-                         ["no outstanding issues; ending the loop"])
+                         ["no outstanding issues; ending the loop"],
+                         commentary=narrate("APPROVED"))
             self.approved = True
             return False
 
@@ -1046,6 +1462,7 @@ class PetCareAgent:
                 "NOT APPROVED - no progress this iteration, stopping",
                 [f"{len(issues)} issue(s) remain, unchanged from the previous pass",
                  "these need a human decision:"] + [str(i) for i in issues],
+                commentary=narrate("NOT APPROVED (no progress)"),
             )
             self.approved = False
             return False
@@ -1055,10 +1472,13 @@ class PetCareAgent:
                 iteration, "REFLECTOR",
                 f"NOT APPROVED - iteration budget ({self.max_iterations}) exhausted",
                 [str(i) for i in issues],
+                commentary=narrate("NOT APPROVED (iteration budget exhausted)"),
             )
             self.approved = False
             return False
 
+        # Mid-loop revisions are not narrated: the model would be describing a
+        # schedule that is about to change, and each call costs a round trip.
         self._record(
             iteration, "REFLECTOR",
             f"REVISE - {len(issues)} issue(s) left, running another iteration",
@@ -1080,6 +1500,9 @@ class PetCareAgent:
         self.approved = False
         self.iterations_used = 0
         self._deferred = []
+        self._llm_placements = []
+        if self.commentator is not None:
+            self.commentator.reset_run_budget()
         self.started_at = datetime.now()
         self.finished_at = None
         schedule = list(self.scheduler.generate_plan(today))
@@ -1095,6 +1518,9 @@ class PetCareAgent:
             issues = self.plan(schedule, iteration) + carried
             schedule = self.execute(schedule, issues, iteration)
             remaining = self.evaluate(schedule, iteration)
+            # Publish the current plan before reflecting, so the Reflector's
+            # narration describes the schedule it is actually judging.
+            self.schedule = schedule
             if not self.reflect(remaining, iteration, previous_count):
                 break
             previous_count = len(remaining)
@@ -1173,6 +1599,8 @@ def format_agent_run(agent: "PetCareAgent", source: str = "app") -> str:
     for step in agent.log:
         # Pipes would break the Markdown table, so escape them.
         details = "<br>".join(d.replace("|", "\\|") for d in step.details) or "—"
+        if step.commentary:
+            details += "<br>_LLM: " + step.commentary.replace("|", "\\|") + "_"
         summary = step.summary.replace("|", "\\|")
         lines.append(
             f"| {step.timestamp:%H:%M:%S} | {step.iteration} | {step.stage} | "

@@ -148,3 +148,53 @@ The structural one: `generate_plan()` fits tasks by total minutes and ignores th
 The decision I'm proudest of is one where the scheduler does *less*: it warns about conflicts instead of resolving them. It would have been easy, and would have looked more impressive, to auto-shuffle overlapping tasks. But a preferred time is a preference to the program and a vet appointment to the owner, and software that silently moves a medication is worse than software that points at the problem. Working out which parts of a system should have authority and which should only advise taught me more than any of the code did.
 
 On the AI side: the assistant never once asked me *why* a feature should work a particular way. It would implement conflict resolution or conflict warnings with equal confidence and equal fluency. Knowing which one this app needed required understanding the user — a busy pet owner who'll lose trust the first time the app moves something important without asking. That judgment was the part I had to supply, and it's the part I'd supply again on a bigger project.
+
+---
+
+## 6. What changed in the capstone extension
+
+Sections 1–5 above describe PawPal+ as it stood at the end of Module 3: a
+deterministic scheduler that **warned** about problems and left every decision to the
+owner. Two things changed when I extended it into an applied AI system, and both
+sharpen rather than contradict the conclusion I reached in 5c.
+
+**a. The agent now acts, not just warns**
+
+`PetCareAgent` runs Planner → Executor → Evaluator → Reflector and genuinely edits the
+schedule: it adds missing species care, re-times overlaps, and spaces feedings at least
+six hours apart. That is the opposite of the "warn, don't resolve" stance I defended in
+5c, so I had to decide where the new authority stops. It stops at the owner. A time the
+owner typed is pinned (`_is_user_fixed()`) and never moved; medication is pinned
+separately; and when two pinned tasks collide the agent reports the clash instead of
+breaking the tie. The agent is allowed to fill gaps the owner left, not to overrule
+choices the owner made.
+
+**b. An LLM advises; it never decides**
+
+Adding Google Gemini (`google-genai`) was where 5c's question — which parts of a system
+should have authority and which should only advise — stopped being theoretical. The
+model does two jobs: it narrates the audit trail, and it proposes a time for a missing
+feeding. It is not permitted to do either job authoritatively. Every proposed time goes
+through `_slot_acceptable()`, which applies exactly the checks a rule-chosen slot faces,
+and a rejected suggestion is logged as rejected before the deterministic slot is used.
+
+I tested this with a stub model returning `02:00`, `14:00` and `banana`; all three were
+rejected. More usefully, `19:00` was also rejected — it looks fine to a human, but
+13:30 → 19:00 is 5h30, under the six-hour nutritional minimum. That case convinced me
+the gate was worth the extra code: it catches what plausibility checking misses.
+
+**c. What the extension taught me that the original didn't**
+
+Reliability work on an external API is a different discipline from reliability work on
+my own code. My 35 unit tests are fast and deterministic because `PetCareAgent` defaults
+to `commentator=None`, so the safety-critical path never touches the network. The API
+itself gave me failures I could not have predicted from documentation: a `404` saying my
+chosen model was "no longer available to new users", a `504` that hung for 48 seconds,
+and a `429` revealing the free tier allows only **20 requests per day**. Each one
+produced a code change — a timeout, a per-run call budget, and a fallback path — and
+none of them can break a schedule, because the rules were never depending on the model
+in the first place.
+
+That is the same lesson as 5c, learned at a larger scale: decide deliberately what your
+system is allowed to trust, and make sure the untrusted part can fail without taking the
+useful part down with it.

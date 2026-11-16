@@ -3,3 +3,8 @@ __pycache__/
 .venv_new/
 .pytest_cache/
 .DS_Store
+
+# Secrets — never commit real keys. Copy .env.example to .env and fill it in.
+.env
+.env.*
+!.env.example

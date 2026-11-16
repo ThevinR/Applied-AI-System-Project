@@ -9,6 +9,8 @@ from pawpal_system import (
     MIN_FEEDING_GAP_MINUTES,
     SAFE_WINDOW,
     Frequency,
+    LLMCommentator,
+    is_user_fixed,
     Owner,
     PetCareAgent,
     Pet,
@@ -58,7 +60,8 @@ st.markdown(
 # Objects saved by an older version of the code can lack newer fields (like
 # Task.due_date), so rebuild the Owner if any saved task looks stale.
 if "owner" in st.session_state and any(
-    not hasattr(t, "due_date") for t in st.session_state.owner.get_all_tasks()
+    not hasattr(t, "due_date") or not hasattr(t, "source")
+    for t in st.session_state.owner.get_all_tasks()
 ):
     del st.session_state["owner"]
 if "owner" not in st.session_state:
@@ -67,6 +70,15 @@ owner = st.session_state.owner
 
 # One Scheduler for the whole page, so the task views and the plan agree.
 scheduler = Scheduler(owner)
+
+
+@st.cache_resource(show_spinner=False)
+def get_commentator() -> LLMCommentator:
+    """One Gemini client for the session; reused across reruns."""
+    return LLMCommentator()
+
+
+commentator = get_commentator()
 
 STAGE_ICONS = {
     "INPUT": "📥",
@@ -154,6 +166,9 @@ def task_rows(tasks):
             "Priority": t.priority.name.lower(),
             "Repeats": t.frequency.value,
             "Status": "done" if t.is_completed else "pending",
+            "Set by": "🔒 you" if is_user_fixed(t) else (
+                "🤖 agent" if t.source == "agent" else "— unset"
+            ),
         }
         for t in tasks
     ]
@@ -256,6 +271,19 @@ with st.sidebar:
         "task times. Medication-style tasks are never moved.",
         icon="⚠️",
     )
+    if commentator.status.available:
+        use_llm = st.toggle(
+            "Add AI commentary",
+            value=True,
+            help=f"Narrate the Planner's findings and the Reflector's verdict "
+            f"with Gemini ({commentator.status.model}). The scheduling rules "
+            "are unchanged either way — the model only explains them.",
+        )
+        st.caption(f"🟢 Gemini ready · `{commentator.status.model}`")
+    else:
+        use_llm = False
+        st.caption(f"⚪ AI commentary off — {commentator.status.detail}")
+
     max_iterations = int(
         st.number_input(
             "Max iterations",
@@ -284,10 +312,21 @@ if run_review:
     if not all_tasks:
         st.sidebar.warning("Add at least one task first.")
     else:
-        agent = PetCareAgent(owner, scheduler, max_iterations=max_iterations)
-        with st.spinner("Running Planner → Executor → Evaluator → Reflector…"):
+        agent = PetCareAgent(
+            owner,
+            scheduler,
+            max_iterations=max_iterations,
+            commentator=commentator if use_llm else None,
+        )
+        spinner = (
+            "Running Planner → Executor → Evaluator → Reflector with AI commentary…"
+            if use_llm
+            else "Running Planner → Executor → Evaluator → Reflector…"
+        )
+        with st.spinner(spinner):
             agent.run()
         st.session_state.agent = agent
+        st.session_state.llm_error = commentator.last_error if use_llm else ""
         # The loop logs itself on every run; a logging failure must not lose
         # the review the user just waited for.
         try:
@@ -537,6 +576,8 @@ with tab_review:
                     else:
                         st.caption(f"Logged at {step.timestamp:%H:%M:%S}")
                     render_details(step.details)
+                    if step.commentary:
+                        st.info(step.commentary, icon="💬")
 
         with revised:
             st.subheader("Revised schedule")
@@ -546,6 +587,13 @@ with tab_review:
                 st.info("The agent produced an empty schedule.")
 
         st.divider()
+
+        llm_error = st.session_state.get("llm_error")
+        if llm_error:
+            st.caption(
+                f"⚠️ AI commentary unavailable for this run ({llm_error}). "
+                "The schedule above is unaffected — the rules decide it, not the model."
+            )
 
         log_path = st.session_state.get("agent_log_path")
         log_error = st.session_state.get("agent_log_error")

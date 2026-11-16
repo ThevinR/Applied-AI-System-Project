@@ -1,0 +1,124 @@
+
+========================================================================
+PawPal+ - reproducible execution evidence
+========================================================================
+
+Gemini commentary: ON (gemini-3.5-flash)
+
+========================================================================
+SCENARIO 1  User-entered times are honored exactly
+========================================================================
+
+INPUT (typed by the owner):
+  Timmy (dog) - Lunch feed 13:30 (30 min), Morning walk 07:00 (20 min)
+  Available time today: 600 min
+
+OUTPUT (after the agentic review):
+  07:00  Timmy    Morning walk            20 min  [set by you]
+  07:30  Timmy    Second feed Timmy       15 min  [set by agent]
+  13:30  Timmy    Lunch feed              30 min  [set by you]
+  18:00  Timmy    Water Timmy             15 min  [set by agent]
+
+  Lunch feed still at 13:30: True
+  Morning walk still at 07:00: True
+  Verdict: APPROVED
+
+  [Gemini / PLANNER] Timmy's schedule currently includes his morning walk and lunch feed, but there is no water task scheduled for him today. Proper hydration is essential for his health and overall wellbeing. Please add a water task to ensure his daily care plan is complete and safe.
+
+========================================================================
+SCENARIO 2  Agentic review fills real gaps and approves
+========================================================================
+
+INPUT: Rex (dog) 1 feeding, Mochi (cat) 1 feeding, 600 min available
+
+AUDIT TRAIL:
+  iter 0 | INPUT     | draft plan from Scheduler: 2 task(s)
+      - Rex: Morning feed at 07:00
+      - Mochi: Breakfast feed at 08:00
+  iter 1 | PLANNER   | analyzed 2 task(s); found 4 issue(s)
+      - [HIGH] missing_care: Rex (dog) has no 'water' task scheduled
+      - [HIGH] missing_care: Rex (dog) has no 'walk' task scheduled
+      - [HIGH] missing_care: Mochi (cat) has no 'water' task scheduled
+      - [HIGH] missing_care: Mochi (cat) has no 'litter' task scheduled
+  iter 1 | EXECUTOR  | applied 4 adjustment(s)
+      - added 'Water Rex' at 13:00 (missing 'water' care for Rex)
+      - added 'Walk Rex' at 18:00 (missing 'walk' care for Rex)
+      - added 'Water Mochi' at 13:15 (missing 'water' care for Mochi)
+      - added 'Litter Mochi' at 18:15 (missing 'litter' care for Mochi)
+  iter 1 | EVALUATOR | safety + nutrition check: FAIL (2 violation(s))
+      - [HIGH] feeding_gap: Rex has 1 feeding(s); at least 2 are expected
+      - [HIGH] feeding_gap: Mochi has 1 feeding(s); at least 2 are expected
+  iter 1 | REFLECTOR | REVISE - 2 issue(s) left, running another iteration
+      - [HIGH] feeding_gap: Rex has 1 feeding(s); at least 2 are expected
+      - [HIGH] feeding_gap: Mochi has 1 feeding(s); at least 2 are expected
+  iter 2 | PLANNER   | analyzed 6 task(s); found 0 issue(s)
+      - schedule looks complete and conflict-free
+  iter 2 | EXECUTOR  | applied 4 adjustment(s)
+      - added 'Second feed Rex' at 18:30, 11h30 after the first so Rex gets two evenly spaced feedings
+      - added 'Second feed Mochi' at 18:45, 10h45 after the first so Mochi gets two evenly spaced feedings
+      - Gemini gave no usable time for 'Second feed Rex'; used the rule-based slot
+      - Gemini gave no usable time for 'Second feed Mochi'; used the rule-based slot
+  iter 2 | EVALUATOR | safety + nutrition check: PASS
+      - all safety and nutritional goals met
+  iter 2 | REFLECTOR | APPROVED - schedule is safe, complete and well spaced
+      - no outstanding issues; ending the loop
+
+FINAL SCHEDULE:
+  07:00  Rex      Morning feed            15 min  [set by you]
+  08:00  Mochi    Breakfast feed          15 min  [set by you]
+  13:00  Rex      Water Rex               15 min  [set by agent]
+  13:15  Mochi    Water Mochi             15 min  [set by agent]
+  18:00  Rex      Walk Rex                15 min  [set by agent]
+  18:15  Mochi    Litter Mochi            15 min  [set by agent]
+  18:30  Rex      Second feed Rex         15 min  [set by agent]
+  18:45  Mochi    Second feed Mochi       15 min  [set by agent]
+
+  Verdict: APPROVED after 2 iteration(s)
+  Time committed: 120 of 600 min
+
+========================================================================
+SCENARIO 3  Not enough time: the agent escalates instead of guessing
+========================================================================
+
+INPUT: Rex (dog), 2 tasks totalling 40 min, but only 30 min available
+
+OUTSTANDING ISSUES (reported, not silently fixed):
+  - [HIGH] over_budget: 'Evening walk' for Rex: needs 20 min but only 10 of 30 min are free
+  - [HIGH] over_budget: 'water' care for Rex: needs 15 min but only 10 of 30 min are free
+  - [HIGH] feeding_gap: Rex has 1 feeding(s); at least 2 are expected
+  - 4 issue(s) remain, unchanged from the previous pass
+  - these need a human decision:
+  - [HIGH] over_budget: 'Evening walk' for Rex: needs 20 min but only 10 of 30 min are free
+  - [HIGH] over_budget: 'water' care for Rex: needs 15 min but only 10 of 30 min are free
+  - [HIGH] over_budget: a second feeding for Rex: needs 15 min but only 10 of 30 min are free
+  - [HIGH] feeding_gap: Rex has 1 feeding(s); at least 2 are expected
+
+  Verdict: NEEDS REVIEW
+  Time committed: 20 of 30 min (guardrail held: True)
+  Tasks owned by Rex: 2 (no duplicates invented)
+
+  [Gemini / PLANNER] Today's plan for Rex is currently missing a fresh water task, which is vital for keeping him hydrated and healthy. Additionally, his Evening walk has not been scheduled yet, leaving him without his necessary daily exercise. Adding water care and a time for his walk will make Rex's routine complete.
+
+========================================================================
+SCENARIO 4  Guardrail: every LLM time is re-checked by the rules
+========================================================================
+
+Setup: Timmy (dog) already fed at 13:30. The model is asked where the
+second feeding goes. Rules require >= 360 min (6h) spacing,
+inside a day block {'morning': ('07:00', '09:00'), 'afternoon': ('13:00', '15:00'), 'evening': ('18:00', '20:00')}.
+
+  Model says   Verdict    Placed at   Why
+  ---------------------------------------
+  19:30        ACCEPTED   19:30       6h00 after 13:30, inside evening block
+  07:30        ACCEPTED   07:30       6h00 before 13:30, inside morning block
+  19:00        REJECTED   07:30       only 5h30 from 13:30 - under the minimum
+  14:00        REJECTED   07:30       only 30 min from 13:30
+  02:00        REJECTED   07:30       outside the safe window and every block
+  banana       REJECTED   07:30       unparseable reply
+
+  A rejected suggestion falls back to the rule-chosen slot.
+  A hallucinated time can never reach the schedule.
+
+========================================================================
+Done
+========================================================================
